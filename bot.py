@@ -10,14 +10,13 @@ import asyncio
 import html
 import time
 from collections import defaultdict, deque
-from datetime import datetime, time as dt_time, timedelta, timezone   # `time` is the stdlib module here
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import asyncpg
 import feedparser
 import io
 import json
-import traceback
 import logging
 import os
 import re
@@ -59,8 +58,6 @@ CANDLE_LIMIT = min(150, max(100, int(os.getenv("CANDLE_LIMIT", "150"))))
 MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT_ANALYSES", "3")))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ALERT_INTERVAL = max(60, int(os.getenv("ALERT_INTERVAL_SECONDS", "180")))
-# Housekeeping for the analyses table (optional env; bot runs fine without it).
-ANALYSES_RETENTION_DAYS = max(1, int(os.getenv("ANALYSES_RETENTION_DAYS", "30")))
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
 BKASH_NUMBER = os.getenv("BKASH_NUMBER", "").strip()
 NAGAD_NUMBER = os.getenv("NAGAD_NUMBER", "").strip()
@@ -70,17 +67,9 @@ ADMIN_CONTACT_NAME = os.getenv("ADMIN_CONTACT_NAME", "—͞Tᴍ Mᴜsᴀ").strip
 ADMIN_CONTACT_USERNAME = os.getenv("ADMIN_CONTACT_USERNAME", "tmmusa73").strip().lstrip("@")
 PRICE_ALERT_CHANNEL_ID = os.getenv("PRICE_ALERT_CHANNEL_ID", "").strip()
 PRICE_CARD_BRAND = os.getenv("PRICE_CARD_BRAND", "@cryptoaiteacherbot").strip()
-# USDT (TRC20) auto-verification. Deliberately EMPTY by default: with no wallet
-# address the feature stays dormant and the manual TrxID approval keeps working.
-USDT_TRC20_ADDRESS = os.getenv("USDT_TRC20_ADDRESS", "").strip()
-TRON_API_KEY = os.getenv("TRON_API_KEY", "").strip()   # optional: only lifts rate limits
-USDT_TRC20_DECIMALS = 6
-TRONGRID_TRC20_URL = "https://api.trongrid.io/v1/accounts/{wallet}/transactions/trc20"
-TRONSCAN_TRC20_URL = "https://apilist.tronscanapi.com/api/filter/trc20/transfers"
-USDT_AMOUNT_TOLERANCE = 0.002
 SUPPORTED_TF = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"}
 
-SYSTEM_INSTRUCTION = """You are a disciplined crypto technical analyst. Analyze ONLY the data supplied by the application; never invent prices, news or unstated live data. Write the analysis in the language requested by the prompt (the analysis_bn field carries the final text whatever that language is). Explain R1/R2/R3, S1/S2/S3, market structure, breakout state, confirmation, invalidation and conditional considerations. Never promise profit. The analysis_bn value must be clean plain text: do not use Markdown, asterisks, hashtags, backticks, tables, HTML, decorative separators or code fences. Use short titled sections, normal line breaks and the bullet character • only. Trendline indices are zero-based candle positions and must be inside the supplied array. Output strictly one JSON object matching the requested schema, with no surrounding commentary."""
+SYSTEM_INSTRUCTION = """You are a disciplined crypto technical analyst. Analyze ONLY the data supplied by the application; never invent prices, news or unstated live data. Return clear Bengali analysis. Explain R1/R2/R3, S1/S2/S3, market structure, breakout state, confirmation, invalidation and conditional considerations. Never promise profit. The analysis_bn value must be clean plain text: do not use Markdown, asterisks, hashtags, backticks, tables, HTML, decorative separators or code fences. Use short titled sections, normal line breaks and the bullet character • only. Trendline indices are zero-based candle positions and must be inside the supplied array. Output strictly one JSON object matching the requested schema, with no surrounding commentary."""
 
 FUTURES_SCREENSHOT_SCHEMA = {
     "type":"object",
@@ -131,26 +120,6 @@ class Request:
     symbol: str       # CCXT unified form, e.g. BTC/USDT
     timeframe: str
     transcript: str = ""
-    language: str = "bn"   # users.language (bn|en); drives the report language
-
-
-def is_english(language: str | None) -> bool:
-    """True when the saved user setting asks for English output."""
-    return str(language or "bn").lower().startswith("en")
-
-
-def language_instruction(language: str | None) -> str:
-    """Prompt directive so the SAME system instruction can serve bn and en.
-
-    Before this, `users.language` was saved by /settings but never reached the
-    model: the system instruction always asked for Bengali, so picking English
-    changed nothing. The directive now travels with the prompt instead.
-    """
-    if is_english(language):
-        return ("Write the entire report in clear, simple English. Keep the field name "
-                "analysis_bn (it is the report text field) but fill it with English text.")
-    return ("Write the entire report in clear, simple Bengali (বাংলা). Keep the field name "
-            "analysis_bn and fill it with Bengali text.")
 
 class UserInputError(Exception):
     """A safe validation error that can be shown to a user."""
@@ -264,285 +233,6 @@ def quant_snapshot(df: pd.DataFrame) -> dict[str, Any]:
             "breakout":breakout,"professional":professional}
 
 
-TRIAL_DAYS = 3              # free Pro trial for a brand-new user, once per account
-REFERRAL_REWARD_DAYS = 3    # days added to the referrer after the invitee actually pays
-DAILY_REPORT_UTC_HOUR = int(os.getenv("DAILY_REPORT_UTC_HOUR", "3"))   # 03:00 UTC = 09:00 Dhaka
-STABLE_BASES = {"USDC","FDUSD","TUSD","USDP","DAI","BUSD","USDT"}
-
-
-def top_movers(payload: Any, n: int = 5, min_quote_volume: float = 20_000_000.0) -> dict[str,Any]:
-    """Top gainers/losers from the Binance 24h ticker list (pure).
-
-    Only liquid USDT pairs are considered, so the report never headlines a
-    dead coin with a fake 400% candle.
-    """
-    if not isinstance(payload,list): return {"gainers":[],"losers":[]}
-    rows=[]
-    for item in payload:
-        try:
-            symbol=str(item.get("symbol",""))
-            if not symbol.endswith("USDT"): continue
-            base=symbol[:-4]
-            if base in STABLE_BASES or base.endswith("UP") or base.endswith("DOWN"): continue
-            change=float(item.get("priceChangePercent")); volume=float(item.get("quoteVolume"))
-            if volume<min_quote_volume: continue
-            rows.append({"symbol":f"{base}/USDT","change":round(change,2),
-                         "price":float(item.get("lastPrice")),"volume":round(volume/1e6,1)})
-        except (TypeError,ValueError): continue
-    rows.sort(key=lambda row: row["change"])
-    return {"gainers":list(reversed(rows[-n:])),"losers":rows[:n]}
-
-
-def parse_okx_tickers(payload: Any) -> list[dict[str,Any]]:
-    """Convert OKX SPOT tickers into Binance-style 24h rows (pure).
-
-    Used only as a fallback: some regions get HTTP 451 from api.binance.com.
-    """
-    data=(payload or {}).get("data") if isinstance(payload,dict) else None
-    rows=[]
-    for item in data or []:
-        try:
-            inst=str(item.get("instId",""))
-            if not inst.endswith("-USDT"): continue
-            open24=float(item.get("open24h") or 0); last=float(item.get("last") or 0)
-            if open24<=0 or last<=0: continue
-            rows.append({"symbol":inst.replace("-",""),"priceChangePercent":str(round((last/open24-1)*100,4)),
-                         "quoteVolume":str(item.get("volCcy24h") or 0),"lastPrice":str(last)})
-        except (TypeError,ValueError): continue
-    return rows
-
-
-def usdt_wallet() -> str:
-    """The TRC20 wallet address, or "" when the feature is switched off."""
-    return USDT_TRC20_ADDRESS
-
-
-def parse_usdt_price(text: Any) -> float | None:
-    """Read a USDT price out of PRO_30_PRICE / PRO_90_PRICE (pure).
-
-    Only USDT/USD/$ amounts are accepted — a BDT price cannot be verified
-    on-chain without an exchange rate, so it returns None and the bot falls
-    back to manual approval instead of guessing.
-    """
-    raw=str(text or "").strip().lower()
-    if not raw: return None
-    if any(token in raw for token in ("bdt","tk","৳","taka","contact","admin")): return None
-    cleaned=raw.replace("usdt","").replace("$","").replace(",","").replace(" ", "")
-    try:
-        value=float(cleaned)
-    except ValueError: return None
-    return round(value,3) if 0<value<=1_000_000 else None
-
-
-def unique_usdt_amount(base: float, seed: int) -> float:
-    """Add a small unique fraction (0.010-0.099) so a payment can be identified.
-
-    Example: 15.000 with seed 4217 -> 15.087 USDT.
-    """
-    step=(int(abs(seed))%90)+10
-    return round(float(base)+step/1000,3)
-
-
-def usdt_amount_matches(actual: float, expected: float, tolerance: float = USDT_AMOUNT_TOLERANCE) -> bool:
-    """True when an on-chain amount equals the requested unique amount."""
-    try: return abs(float(actual)-float(expected))<=tolerance
-    except (TypeError,ValueError): return False
-
-
-def _usdt_transfer(txid: str, sender: str, recipient: str, amount: float, timestamp_ms: int) -> dict[str,Any]:
-    return {"txid":str(txid),"from":str(sender),"to":str(recipient),
-            "amount":round(float(amount),6),"timestamp_ms":int(timestamp_ms)}
-
-
-def parse_trongrid_trc20(payload: Any, wallet: str) -> list[dict[str,Any]]:
-    """Normalise TronGrid /v1/accounts/<wallet>/transactions/trc20 (pure)."""
-    rows=[]; wallet=str(wallet or "")
-    data=(payload or {}).get("data") if isinstance(payload,dict) else None
-    for item in data or []:
-        try:
-            info=item.get("token_info") or {}
-            if str(info.get("symbol","")).upper()!="USDT": continue
-            decimals=int(info.get("decimals",USDT_TRC20_DECIMALS) or USDT_TRC20_DECIMALS)
-            to=str(item.get("to","")); sender=str(item.get("from",""))
-            if wallet and to!=wallet: continue          # only incoming transfers count
-            amount=float(item.get("value") or 0)/(10**decimals)
-            rows.append(_usdt_transfer(item.get("transaction_id",""),sender,to,amount,
-                                       int(item.get("block_timestamp") or 0)))
-        except (TypeError,ValueError,KeyError): continue
-    return rows
-
-
-def parse_tronscan_trc20(payload: Any, wallet: str) -> list[dict[str,Any]]:
-    """Normalise Tronscan /api/filter/trc20/transfers (pure, fallback source)."""
-    rows=[]; wallet=str(wallet or "")
-    data=(payload or {}).get("data") if isinstance(payload,dict) else None
-    for item in data or []:
-        try:
-            info=item.get("tokenInfo") or {}
-            if str(info.get("tokenAbbr","")).upper()!="USDT": continue
-            decimals=int(info.get("tokenDecimal",USDT_TRC20_DECIMALS) or USDT_TRC20_DECIMALS)
-            to=str(item.get("toAddress","")); sender=str(item.get("fromAddress",""))
-            if wallet and to!=wallet: continue
-            amount=float(item.get("quant") or 0)/(10**decimals)
-            rows.append(_usdt_transfer(item.get("transaction_id",""),sender,to,amount,
-                                       int(item.get("block_ts") or 0)))
-        except (TypeError,ValueError,KeyError): continue
-    return rows
-
-
-def match_usdt_transfer(transfers: list[dict[str,Any]], expected_amount: float,
-                        since_ms: int = 0) -> dict[str,Any] | None:
-    """Newest transfer that matches the expected unique amount (pure)."""
-    candidates=[item for item in transfers
-                if int(item.get("timestamp_ms") or 0)>=int(since_ms or 0)
-                and usdt_amount_matches(item.get("amount",0),expected_amount)]
-    if not candidates: return None
-    return max(candidates,key=lambda item: int(item.get("timestamp_ms") or 0))
-
-
-def parse_referral_payload(payload: Any) -> int | None:
-    """Read a Telegram deep-link payload such as `ref_123456789` (pure)."""
-    text=str(payload or "").strip()
-    if not text.lower().startswith("ref_"): return None
-    value=text[4:]
-    return int(value) if value.isdigit() and int(value)>0 else None
-
-
-def referral_summary(rows: list[Any]) -> list[dict[str,Any]]:
-    """Per-referrer leaderboard: invited count and how many actually paid (pure)."""
-    counts: dict[int,dict[str,Any]] = {}
-    for row in rows:
-        referrer=int(row["referrer_id"])
-        entry=counts.setdefault(referrer,{"referrer_id":referrer,"invited":0,"rewarded":0})
-        entry["invited"]+=1
-        if row.get("rewarded_at"): entry["rewarded"]+=1
-    return sorted(counts.values(),key=lambda item:(-item["invited"],item["referrer_id"]))
-
-
-def price_level_direction(level: float, price: float) -> str:
-    """Decide whether a level is above or below the current price."""
-    return "above" if float(level)>float(price) else "below"
-
-
-def price_level_triggered(level: float, direction: str, price: float) -> bool:
-    """One-shot crossing test used by the alert cycle (pure)."""
-    if not price or not level: return False
-    return float(price)>=float(level) if str(direction).lower()=="above" else float(price)<=float(level)
-
-
-def portfolio_pnl(holdings: list[Any], prices: dict[str,float]) -> dict[str,Any]:
-    """Unrealised PnL table for stored holdings (pure)."""
-    rows=[]; total_value=total_cost=0.0; missing=[]
-    for item in holdings:
-        symbol=str(item["symbol"]); amount=float(item["amount"]); cost=float(item["avg_cost"])
-        price=float(prices.get(symbol) or 0)
-        if price<=0:
-            missing.append(symbol); continue
-        value=amount*price; spent=amount*cost
-        rows.append({"symbol":symbol,"amount":amount,"avg_cost":cost,"price":price,
-                     "value":value,"cost":spent,"pnl":value-spent,
-                     "pnl_pct":((value-spent)/spent*100) if spent else 0.0})
-        total_value+=value; total_cost+=spent
-    rows.sort(key=lambda row: row["value"],reverse=True)
-    return {"rows":rows,"total_value":total_value,"total_cost":total_cost,
-            "total_pnl":total_value-total_cost,
-            "total_pnl_pct":((total_value-total_cost)/total_cost*100) if total_cost else 0.0,
-            "missing":missing}
-
-
-SCORECARD_MIN_MOVE_PCT = 0.5      # a move this large counts as real follow-through
-
-
-def event_follow_through(frame: pd.DataFrame, candle_close: Any, close_price: float,
-                         event_type: str, max_candles: int = 10) -> float | None:
-    """Best move (%) in the candles AFTER the signal candle — no look-ahead.
-
-    Breakouts measure the highest high, breakdowns the lowest low, both against
-    the signal close. Returns None when the window has not formed yet.
-    """
-    if not close_price or not len(frame): return None
-    close_ts=pd.Timestamp(candle_close)
-    # searchsorted lands ON the signal candle; the window must start after it,
-    # otherwise the signal candle's own high would score itself as a hit.
-    position=int(frame.index.searchsorted(close_ts))+1
-    future=frame.iloc[position:position+max_candles]
-    if not len(future): return None
-    try:
-        if "BREAKDOWN" in event_type:
-            return round((1-float(future.Low.min())/close_price)*100,2)
-        return round((float(future.High.max())/close_price-1)*100,2)
-    except (TypeError,ValueError):
-        return None
-
-
-def scorecard_stats(rows: list[Any]) -> dict[str,Any]:
-    """Aggregate stored breakout events into a hit-rate scorecard (pure).
-
-    `rows` items need event_type and max_follow_through_pct (None = pending).
-    """
-    evaluated=[r for r in rows if r["max_follow_through_pct"] is not None]
-    by_type: dict[str,dict[str,int]] = {}
-    by_timeframe: dict[str,dict[str,int]] = {}
-    for row in evaluated:
-        for bucket,key in ((by_type,"event_type"),(by_timeframe,"timeframe")):
-            entry=bucket.setdefault(str(row.get(key) or "?"),{"total":0,"hit":0})
-            entry["total"]+=1
-            if float(row["max_follow_through_pct"])>=SCORECARD_MIN_MOVE_PCT: entry["hit"]+=1
-    moves=[float(r["max_follow_through_pct"]) for r in evaluated]
-    hits=sum(1 for move in moves if move>=SCORECARD_MIN_MOVE_PCT)
-    return {"total":len(rows),"evaluated":len(evaluated),"pending":len(rows)-len(evaluated),
-            "hits":hits,"hit_rate":round(hits/len(evaluated)*100,1) if evaluated else 0.0,
-            "avg_move":round(sum(moves)/len(moves),2) if moves else 0.0,
-            "best":round(max(moves),2) if moves else None,
-            "worst":round(min(moves),2) if moves else None,
-            "by_type":{k:{**v,"rate":round(v["hit"]/v["total"]*100,1) if v["total"] else 0.0} for k,v in by_type.items()},
-            "by_timeframe":{k:{**v,"rate":round(v["hit"]/v["total"]*100,1) if v["total"] else 0.0} for k,v in by_timeframe.items()}}
-
-
-MTF_TIMEFRAMES = ("15m","1h","4h","1d")
-MTF_WEIGHTS = {"1d":1.5,"4h":1.2,"1h":1.0,"15m":0.8}
-
-
-def mtf_confluence(per_timeframe: dict[str,dict[str,Any]]) -> dict[str,Any]:
-    """Weighted agreement of 15m/1h/4h/1d (0-100 bullish share).
-
-    Pure: the caller supplies one small dict per timeframe, so this can be
-    tested without any exchange access. Higher timeframes weigh more.
-    """
-    bullish=0.0; bearish=0.0; aligned={}
-    total=sum(MTF_WEIGHTS.values())     # fixed denominator: unavailable timeframes
-    coverage=0                          # must not silently become a full score
-    for tf in MTF_TIMEFRAMES:
-        item=per_timeframe.get(tf) or {}
-        if item.get("status")=="unavailable":
-            aligned[tf]={"status":"unavailable"}; continue
-        weight=MTF_WEIGHTS[tf]; coverage+=1
-        structure=str(item.get("structure","")).lower()
-        above=bool(item.get("above_ema50")); rsi=float(item.get("rsi") or 50)
-        score=0.0
-        score+=1.0 if structure.startswith("bullish") else (-1.0 if structure.startswith("bearish") else 0.0)
-        score+=0.5 if above else -0.5
-        score+=0.5 if rsi>=55 else (-0.5 if rsi<=45 else 0.0)
-        if score>0: bullish+=weight
-        elif score<0: bearish+=weight
-        aligned[tf]={"structure":item.get("structure"),"rsi":round(rsi,1),"above_ema50":above,
-                     "state":item.get("state"),"lean":"bullish" if score>0 else ("bearish" if score<0 else "neutral"),
-                     "weight":weight}
-    if coverage==0:
-        return {"status":"unavailable","score":50,"bearish_score":50,"bias":"mixed",
-                "aligned_count":0,"coverage":0,"timeframes":aligned,
-                "reading":"টাইমফ্রেম ডেটা পাওয়া যায়নি"}
-    dominant=max(bullish,bearish); share=dominant/total*100
-    bias="bullish" if bullish>bearish else ("bearish" if bearish>bullish else "mixed")
-    aligned_count=sum(1 for v in aligned.values() if v.get("lean")==bias)
-    return {"status":"live" if coverage==len(MTF_TIMEFRAMES) else "partial",
-            "score":round(share),"bearish_score":round(100-share),"bias":bias,
-            "aligned_count":aligned_count,"coverage":coverage,"timeframes":aligned,
-            "reading":("সব টাইমফ্রেম একই দিকে" if aligned_count==len(MTF_TIMEFRAMES)
-                       else f"{aligned_count}/{len(MTF_TIMEFRAMES)} টাইমফ্রেম {bias} দিকে"
-                            + ("" if coverage==len(MTF_TIMEFRAMES) else f" ({coverage}/{len(MTF_TIMEFRAMES)} টাইমফ্রেম পাওয়া গেছে)"))}
-
-
 def timeframe_delta(timeframe: str) -> timedelta:
     unit=timeframe[-1].lower(); value=int(timeframe[:-1])
     return {"m":timedelta(minutes=value),"h":timedelta(hours=value),"d":timedelta(days=value),"w":timedelta(weeks=value)}[unit]
@@ -578,206 +268,28 @@ def scan_breakout_history(df: pd.DataFrame, lookback: int = 20, timeframe: str =
     return events[-20:]
 
 
-def _backtest_trades(df: pd.DataFrame, fee_pct: float, slippage_pct: float, fee_is_percent: bool = True) -> list[dict[str,Any]]:
-    """Closed trades only, each with its net R after fees and slippage."""
-    events=scan_breakout_history(df); trades=[]
-    slip=slippage_pct/100; fee=fee_pct/100
+def simple_backtest(df: pd.DataFrame) -> dict[str, Any]:
+    """Backtest confirmed range breaks with ATR stop and 2R target, no look-ahead."""
+    events=scan_breakout_history(df); wins=losses=open_trades=0; returns=[]
     for event in events:
         if "CONFIRMED" not in event["state"]: continue
         i=df.index.get_indexer([pd.Timestamp(event["time"])])[0]
         if i<0 or i+1>=len(df): continue
-        raw_entry=float(df.Close.iloc[i]); atr=(df.High-df.Low).rolling(14).mean().iloc[i]
-        if pd.isna(atr) or atr<=0: continue
-        long="BREAKOUT" in event["state"]
-        entry=raw_entry*(1+slip) if long else raw_entry*(1-slip)      # worse fill
-        stop=raw_entry-float(atr) if long else raw_entry+float(atr)
-        target=raw_entry+2*float(atr) if long else raw_entry-2*float(atr)
-        stop_distance=abs(entry-stop)
-        if stop_distance<=0: continue
+        entry=float(df.Close.iloc[i]); tr=(df.High-df.Low).rolling(14).mean().iloc[i]
+        if pd.isna(tr): continue
+        long="BREAKOUT" in event["state"]; stop=entry-float(tr) if long else entry+float(tr); target=entry+2*float(tr) if long else entry-2*float(tr)
         outcome=None
-        for _,row in df.iloc[i+1:i+21].iterrows():
+        for _,r in df.iloc[i+1:i+21].iterrows():
             # Conservative assumption: stop wins if stop and target occur in one candle.
-            if (long and row.Low<=stop) or (not long and row.High>=stop): outcome=-1.0; break
-            if (long and row.High>=target) or (not long and row.Low<=target): outcome=2.0; break
-        if outcome is None: continue
-        # Round-trip fees expressed in R (position notional = units * entry).
-        fee_r=(2*fee*entry)/stop_distance
-        trades.append({"time":event["time"],"state":event["state"],
-                       "gross_r":outcome,"net_r":outcome-fee_r,"fee_r":fee_r,
-                       "follow":event.get("max_follow_through_10_candles_pct")})
-    return trades
-
-
-def _backtest_summary(trades: list[dict[str,Any]]) -> dict[str,Any]:
-    closed=len(trades); wins=sum(1 for t in trades if t["net_r"]>0); losses=closed-wins
-    return {"trades":closed,"wins":wins,"losses":losses,
-            "win_rate":wins/closed*100 if closed else 0,
-            "net_r_multiple":round(sum(t["net_r"] for t in trades),2),
-            "avg_r":round(sum(t["net_r"] for t in trades)/closed,2) if closed else 0,
-            "gross_r_multiple":round(sum(t["gross_r"] for t in trades),2)}
-
-
-def simple_backtest(df: pd.DataFrame, fee_pct: float = 0.10, slippage_pct: float = 0.05,
-                    split: float = 0.7) -> dict[str, Any]:
-    """Backtest confirmed range breaks: 1 ATR stop, 2 ATR target, no look-ahead.
-
-    Unlike the first version this charges fees (default 0.10% per side, a typical
-    taker fee) and slippage (0.05%), and reports in-sample vs out-of-sample, so
-    the win rate is not flattered by a handful of trades.
-    """
-    trades=_backtest_trades(df,fee_pct,slippage_pct)
-    overall=_backtest_summary(trades)
-    cut=max(1,int(len(trades)*split)) if trades else 0
-    in_sample=_backtest_summary(trades[:cut])
-    out_sample=_backtest_summary(trades[cut:])
-    return {**overall,"open_or_expired":max(0,len(scan_breakout_history(df))-len(trades)),
-            "fee_pct":fee_pct,"slippage_pct":slippage_pct,
-            "in_sample":in_sample,"out_sample":out_sample,
-            "candles":int(len(df)),
-            "assumptions":(f"entry at signal close + {slippage_pct:.2f}% slippage; 1 ATR stop; "
-                           f"2 ATR target; max 20 candles; fees {fee_pct:.2f}%/side; "
-                           f"in-sample = oldest {int(split*100)}%, out-of-sample = newest {100-int(split*100)}%")}
-
-
-def futures_calc(entry: float, stop: float, capital: float, risk_pct: float, leverage: float,
-                 target: float | None = None, side: str | None = None,
-                 fee_pct: float = 0.05, maintenance_rate: float = 0.005) -> dict[str,Any]:
-    """Leverage / liquidation / position sizing in one deterministic pass.
-
-    Isolated-margin approximation: liquidation sits at 1/leverage away from the
-    entry, shifted by the maintenance-margin rate. Fees are round-trip taker fees
-    on the position value, so the numbers are conservative on purpose.
-    """
-    values=[entry,stop,capital,risk_pct,leverage]
-    if any(v<=0 for v in values) or entry==stop or maintenance_rate<0 or fee_pct<0:
-        raise ValueError("Invalid positive values")
-    direction=(side or ("long" if stop<entry else "short")).lower()
-    if direction not in {"long","short"}: raise ValueError("side must be long or short")
-    stop_distance=abs(entry-stop)
-    risk_cash=capital*risk_pct/100
-    units=risk_cash/stop_distance
-    position_value=units*entry
-    margin=position_value/leverage
-    if direction=="long":
-        liquidation=entry*(1-1/leverage+maintenance_rate)
-    else:
-        liquidation=entry*(1+1/leverage-maintenance_rate)
-    fees=position_value*fee_pct/100*2
-    reward_r=(abs(target-entry)/stop_distance) if target else None
-    warnings=[]
-    if margin>capital: warnings.append("মার্জিন আপনার ব্যালেন্সের চেয়ে বেশি — লিভারেজ কমান")
-    if leverage>25: warnings.append("২৫x-এর বেশি লিভারেজ: লিকুইডেশন খুব কাছে")
-    liquidation_before_stop=(liquidation>=stop) if direction=="long" else (liquidation<=stop)
-    if liquidation_before_stop: warnings.append("লিকুইডেশন স্টপ-লসের আগেই হিট করবে — স্টপ টিকবে না")
-    return {"direction":direction,"risk_cash":risk_cash,"stop_distance":stop_distance,
-            "stop_distance_pct":stop_distance/entry*100,"units":units,"position_value":position_value,
-            "margin":margin,"liquidation":liquidation,"leverage":leverage,
-            "fees_round_trip":fees,"risk_including_fees":risk_cash+fees,
-            "reward_r":reward_r,"warnings":warnings}
-
-
-FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
-GLOBAL_MARKET_URL = "https://api.coingecko.com/api/v3/global"
-
-
-async def http_json(url: str, params: dict[str,str] | None = None, timeout: float = 10.0,
-                    headers: dict[str,str] | None = None) -> Any:
-    """Small JSON GET used by the free public endpoints (no API keys needed)."""
-    merged={"User-Agent":"CryptoAnalystBot/1.0"}
-    merged.update(headers or {})
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout),
-                                     headers=merged) as session:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            return await response.json()
-
-
-def parse_open_interest_history(payload: Any) -> dict[str,float]:
-    """Turn /futures/data/openInterestHist into 1h/4h/24h change percentages."""
-    if not isinstance(payload,list) or len(payload)<2: return {}
-    try: values=[float(item.get("sumOpenInterest",0)) for item in payload]
-    except (TypeError,ValueError): return {}
-    if not values or values[-1]<=0 or values[0]<=0: return {}
-    latest=values[-1]; out={}
-    for label,steps_back in (("1h",1),("4h",4),("24h",24)):
-        if len(values)>steps_back and values[-1-steps_back]>0:
-            out[label]=(latest-values[-1-steps_back])/values[-1-steps_back]*100
-    return out
-
-
-def parse_ratio_field(payload: Any, field: str) -> float | None:
-    """Read the newest entry of a /futures/data/* ratio list."""
-    if not isinstance(payload,list) or not payload: return None
-    try: return float(payload[-1][field])
-    except (KeyError,TypeError,ValueError): return None
-
-
-def parse_fear_greed(payload: Any) -> dict[str,Any] | None:
-    """alternative.me Fear & Greed index (value 0-100 + label)."""
-    try:
-        item=payload["data"][0]
-        return {"value":int(item["value"]),"label":str(item.get("value_classification","")).strip(),
-                "updated":str(item.get("timestamp",""))}
-    except (KeyError,IndexError,TypeError,ValueError): return None
-
-
-def parse_coingecko_global(payload: Any) -> dict[str,Any] | None:
-    """BTC/ETH dominance and 24h total-market-cap change from CoinGecko."""
-    try:
-        data=payload["data"]
-        dom=data.get("market_cap_percentage") or {}
-        return {"btc_dominance":round(float(dom.get("btc")),2) if dom.get("btc") is not None else None,
-                "eth_dominance":round(float(dom.get("eth")),2) if dom.get("eth") is not None else None,
-                "market_cap_change_24h":(round(float(data["market_cap_change_percentage_24h_usd"]),2)
-                                         if data.get("market_cap_change_percentage_24h_usd") is not None else None)}
-    except (KeyError,TypeError,ValueError): return None
-
-
-def oi_price_signal(price_change_pct: float | None, oi_change_pct: float | None) -> str:
-    """Classic OI/price reading: which side is adding exposure."""
-    if price_change_pct is None or oi_change_pct is None: return "unavailable"
-    rising=oi_change_pct>=1.0; falling=oi_change_pct<=-1.0
-    up=price_change_pct>=0.3; down=price_change_pct<=-0.3
-    if up and rising: return "new_money_long"        # price up + OI up
-    if up and falling: return "short_covering"       # price up + OI down
-    if down and rising: return "new_money_short"     # price down + OI up
-    if down and falling: return "long_liquidation"   # price down + OI down
-    return "flat"
-
-
-def chart_zones(quant: dict[str,Any], frame_len: int, lookback: int = 60) -> dict[str,Any]:
-    """Turn the professional snapshot into drawable zones (pure, no plotting).
-
-    pro_quant already computes FVGs, order blocks, volume profile and liquidity
-    sweeps; before this they were explained in text but invisible on the chart.
-    """
-    prof=(quant or {}).get("professional") or {}
-    right_edge=max(0, int(frame_len)-1)
-    def clamp(value: int) -> int:
-        return max(0, min(int(value), right_edge))
-    gaps=[]
-    for item in ((prof.get("imbalances") or {}).get("fair_value_gaps") or []):
-        start=clamp(item.get("idx",0))
-        if right_edge-start>lookback: continue          # too old to be useful
-        gaps.append({"start":start,"end":right_edge,"low":float(item["low"]),"high":float(item["high"]),
-                     "type":str(item.get("type","")),"mitigated":bool(item.get("mitigated"))})
-    blocks=[]
-    for item in ((prof.get("imbalances") or {}).get("order_blocks") or []):
-        start=clamp(item.get("idx",0))
-        if right_edge-start>lookback: continue
-        blocks.append({"start":start,"end":right_edge,"low":float(item["low"]),"high":float(item["high"]),
-                       "type":str(item.get("type",""))})
-    sweeps=[]
-    for item in ((prof.get("liquidity") or {}).get("sweeps") or []):
-        idx=clamp(item.get("idx",0))
-        if right_edge-idx>lookback: continue
-        sweeps.append({"idx":idx,"price":float(item["level"]),"type":str(item.get("type",""))})
-    levels={}
-    for key in ("poc","vah","val"):
-        value=(prof.get("volume_profile") or {}).get(key)
-        if value: levels[key]=float(value)
-    # Cap the lists so a busy chart stays readable (newest zones win).
-    return {"fair_value_gaps":gaps[-6:],"order_blocks":blocks[-4:],"sweeps":sweeps[-6:],"levels":levels}
+            if (long and r.Low<=stop) or (not long and r.High>=stop): outcome=-1; break
+            if (long and r.High>=target) or (not long and r.Low<=target): outcome=2; break
+        if outcome is None: open_trades+=1
+        else:
+            returns.append(outcome); wins+=outcome>0; losses+=outcome<0
+    closed=wins+losses
+    return {"trades":closed,"wins":wins,"losses":losses,"open_or_expired":open_trades,
+            "win_rate":wins/closed*100 if closed else 0,"net_r_multiple":sum(returns),
+            "assumptions":"entry at signal close; 1 ATR stop; 2 ATR target; max 20 candles; fees/slippage excluded"}
 
 
 class AnalystBot:
@@ -788,22 +300,12 @@ class AnalystBot:
         self.parser_model = None
         self.analysis_model = SYSTEM_INSTRUCTION
         self.exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-        # Read-only fallbacks: some regions block or rate-limit Binance. Built
-        # lazily so a missing network path costs nothing at boot.
-        self.fallback_exchanges: dict[str,Any] = {}
-        self.data_source: dict[tuple[str,str],str] = {}
-        self.markets_source: str | None = None       # which venue answered load_markets
-        self.markets_exchange: Any = None            # that venue's client
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         self.markets_loaded = False
         self._market_lock = asyncio.Lock()
         self.db: asyncpg.Pool | None = None
         self.cache = TTLCache(maxsize=512)
         self.last_alert_scan: datetime | None = None
-        # Per (symbol,timeframe) alert state: cached candles + the exact time the
-        # newest closed candle CAN change, so cycles stop re-fetching needlessly.
-        self.alert_cache: dict[tuple[str,str],dict[str,Any]] = {}
-        self.last_alert_cycle: dict[str,Any] = {}
         self.usage_windows: dict[tuple[int,str],deque[float]] = defaultdict(deque)
 
     async def init_db(self) -> None:
@@ -815,8 +317,7 @@ class AnalystBot:
             await con.execute("""
                 CREATE TABLE IF NOT EXISTS users(
                   telegram_id BIGINT PRIMARY KEY, username TEXT, created_at TIMESTAMPTZ DEFAULT NOW(),
-                  plan TEXT NOT NULL DEFAULT 'free', plan_until TIMESTAMPTZ,
-                  trial_used BOOLEAN NOT NULL DEFAULT FALSE, referred_by BIGINT);
+                  plan TEXT NOT NULL DEFAULT 'free', plan_until TIMESTAMPTZ);
                 CREATE TABLE IF NOT EXISTS alerts(
                   id BIGSERIAL PRIMARY KEY, telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
                   chat_id BIGINT NOT NULL, symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
@@ -865,22 +366,6 @@ class AnalystBot:
                   interval_minutes INTEGER NOT NULL CHECK(interval_minutes BETWEEN 5 AND 1440),
                   enabled BOOLEAN NOT NULL DEFAULT TRUE, last_sent_at TIMESTAMPTZ,
                   created_by BIGINT, created_at TIMESTAMPTZ DEFAULT NOW());
-                CREATE TABLE IF NOT EXISTS usdt_payments(
-                  txid TEXT PRIMARY KEY, telegram_id BIGINT, request_id BIGINT,
-                  amount DOUBLE PRECISION, days INTEGER, created_at TIMESTAMPTZ DEFAULT NOW());
-                CREATE TABLE IF NOT EXISTS referrals(
-                  referred_id BIGINT PRIMARY KEY, referrer_id BIGINT NOT NULL,
-                  created_at TIMESTAMPTZ DEFAULT NOW(), rewarded_at TIMESTAMPTZ);
-                CREATE TABLE IF NOT EXISTS price_levels(
-                  id BIGSERIAL PRIMARY KEY, telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
-                  chat_id BIGINT NOT NULL, symbol TEXT NOT NULL, level DOUBLE PRECISION NOT NULL,
-                  direction TEXT NOT NULL DEFAULT 'above', repeat BOOLEAN NOT NULL DEFAULT FALSE,
-                  active BOOLEAN NOT NULL DEFAULT TRUE, last_fired_at TIMESTAMPTZ,
-                  created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(telegram_id,symbol,level));
-                CREATE TABLE IF NOT EXISTS portfolio(
-                  id BIGSERIAL PRIMARY KEY, telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
-                  symbol TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL, avg_cost DOUBLE PRECISION NOT NULL,
-                  updated_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(telegram_id,symbol));
                 CREATE TABLE IF NOT EXISTS admin_audit_log(
                   id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL, action TEXT NOT NULL,
                   target_user_id BIGINT, details JSONB, created_at TIMESTAMPTZ DEFAULT NOW());
@@ -907,119 +392,11 @@ class AnalystBot:
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_candle TEXT")
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_fingerprint TEXT")
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ")
-            # analyses grows by one full JSON payload per request and had no
-            # index for the "previous analysis" lookup; both hurt over time.
-            await con.execute("""CREATE INDEX IF NOT EXISTS idx_analyses_lookup
-                                  ON analyses(telegram_id,symbol,timeframe,created_at DESC)""")
-            await con.execute("CREATE INDEX IF NOT EXISTS idx_analyses_created_at ON analyses(created_at)")
-            # Signal scorecard: what actually happened after each stored event.
-            await con.execute("ALTER TABLE breakout_events ADD COLUMN IF NOT EXISTS max_follow_through_pct DOUBLE PRECISION")
-            await con.execute("ALTER TABLE breakout_events ADD COLUMN IF NOT EXISTS evaluated_at TIMESTAMPTZ")
-            await con.execute("CREATE INDEX IF NOT EXISTS idx_breakout_events_pending ON breakout_events(evaluated_at,candle_close)")
-            # Existing databases predate the trial/referral columns.
-            await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used BOOLEAN NOT NULL DEFAULT FALSE")
-            await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT")
-            await con.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
-            # USDT auto-verify needs the unique expected amount per request.
-            await con.execute("ALTER TABLE subscription_requests ADD COLUMN IF NOT EXISTS usdt_amount DOUBLE PRECISION")
-
-    def alert_snapshot(self, symbol: str, timeframe: str, view: pd.DataFrame) -> dict[str,Any]:
-        """Closed-candle quant for the alert engine, cached per candle.
-
-        quant_snapshot() adds indicator columns (ATR, EMA…) to the frame it is
-        given, and retest_state() reads those columns, so the ENRICHED copy is
-        kept together with its quant dict. The caller's shared frame is never
-        mutated.
-        """
-        stamp=view.index[-1].isoformat() if len(view) else "empty"
-        cache_key=f"alertq:{symbol}:{timeframe}:{stamp}"
-        cached=self.cache.get(cache_key)
-        if cached is not None: return cached
-        enriched=view.copy(deep=True)
-        payload={"quant":quant_snapshot(enriched),"frame":enriched}
-        self.cache.set(cache_key,payload,ttl=6*3600)
-        return payload
 
     async def ensure_user(self, update: Update) -> None:
         if not self.db or not update.effective_user: return
         await self.db.execute("INSERT INTO users(telegram_id,username) VALUES($1,$2) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username",
                               update.effective_user.id, update.effective_user.username)
-
-    async def usdt_transfers(self, limit: int = 50) -> list[dict[str,Any]]:
-        """Incoming USDT TRC20 transfers to the configured wallet.
-
-        TronGrid needs no API key (TRON_API_KEY only lifts rate limits); Tronscan
-        is a fallback. Every failure returns [] so callers never crash.
-        """
-        wallet=usdt_wallet()
-        if not wallet: return []
-        headers={"TRON-PRO-API-KEY":TRON_API_KEY} if TRON_API_KEY else {}
-        try:
-            payload=await http_json(TRONGRID_TRC20_URL.format(wallet=wallet),
-                                    params={"limit":str(limit),"only_confirmed":"true"},
-                                    headers=headers)
-            rows=parse_trongrid_trc20(payload,wallet)
-            if rows: return rows
-        except Exception as exc:
-            log.warning("TronGrid lookup failed: %s",exc)
-        try:
-            payload=await http_json(TRONSCAN_TRC20_URL,
-                                    params={"limit":str(limit),"start":"0","sort":"-timestamp",
-                                            "count":"true","relatedAddress":wallet},
-                                    headers=headers)
-            return parse_tronscan_trc20(payload,wallet)
-        except Exception as exc:
-            log.warning("Tronscan lookup failed: %s",exc)
-            return []
-
-    async def register_referral(self, user_id: int, payload: Any) -> int | None:
-        """Record who invited this user. Only the first link counts."""
-        referrer=parse_referral_payload(payload)
-        if not self.db or not referrer or referrer==user_id: return None
-        try:
-            if not await self.db.fetchval("SELECT 1 FROM users WHERE telegram_id=$1",referrer): return None
-            existing=await self.db.fetchval("SELECT referred_by FROM users WHERE telegram_id=$1",user_id)
-            if existing: return None
-            await self.db.execute("UPDATE users SET referred_by=$2 WHERE telegram_id=$1 AND referred_by IS NULL",
-                                  user_id,referrer)
-            await self.db.execute("INSERT INTO referrals(referred_id,referrer_id) VALUES($1,$2) "
-                                  "ON CONFLICT(referred_id) DO NOTHING",user_id,referrer)
-            return referrer
-        except Exception:
-            log.exception("Referral registration failed for %s",user_id); return None
-
-    async def grant_trial(self, user_id: int) -> bool:
-        """Give the one-time free trial; never shortens an existing paid plan."""
-        if not self.db or TRIAL_DAYS<=0: return False
-        try:
-            row=await self.db.fetchrow("SELECT trial_used,plan,plan_until FROM users WHERE telegram_id=$1",user_id)
-            if not row or row["trial_used"]: return False
-            if row["plan"]=="pro" and row["plan_until"] and row["plan_until"]>datetime.now(timezone.utc):
-                return False
-            await self.db.execute("UPDATE users SET trial_used=TRUE,plan='pro',"
-                                  "plan_until=NOW()+($2::int)*INTERVAL '1 day' WHERE telegram_id=$1",
-                                  user_id,TRIAL_DAYS)
-            return True
-        except Exception:
-            log.exception("Trial grant failed for %s",user_id); return False
-
-    async def reward_referrer(self, referred_id: int) -> int | None:
-        """Credit the referrer once, after the invited user actually pays."""
-        if not self.db or REFERRAL_REWARD_DAYS<=0: return None
-        try:
-            row=await self.db.fetchrow("SELECT referrer_id FROM referrals "
-                                       "WHERE referred_id=$1 AND rewarded_at IS NULL",referred_id)
-            if not row: return None
-            referrer=int(row["referrer_id"])
-            await self.db.execute("UPDATE referrals SET rewarded_at=NOW() WHERE referred_id=$1",referred_id)
-            await self.db.execute("INSERT INTO users(telegram_id,plan,plan_until) "
-                                  "VALUES($1,'pro',NOW()+($2::int)*INTERVAL '1 day') "
-                                  "ON CONFLICT(telegram_id) DO UPDATE SET plan='pro',"
-                                  "plan_until=GREATEST(COALESCE(users.plan_until,NOW()),NOW())"
-                                  "+($2::int)*INTERVAL '1 day'",referrer,REFERRAL_REWARD_DAYS)
-            return referrer
-        except Exception:
-            log.exception("Referral reward failed for %s",referred_id); return None
 
     async def effective_plan(self, user_id: int | None) -> str:
         if user_id in ADMIN_IDS: return "admin"
@@ -1066,9 +443,6 @@ class AnalystBot:
     async def close(self) -> None:
         if self.db: await self.db.close()
         await self.exchange.close()
-        for exchange in self.fallback_exchanges.values():
-            try: await exchange.close()
-            except Exception: log.warning("Fallback exchange close failed", exc_info=True)
         await self.gemini.aio.aclose()
 
     @staticmethod
@@ -1194,109 +568,26 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         transcript = str(data.get("transcript", "")).strip()
         return Request(self._normalize_symbol(str(data["symbol"])), self._normalize_tf(str(data.get("timeframe", "4h"))), transcript)
 
-    def _fallback(self, name: str) -> Any:
-        if name not in self.fallback_exchanges:
-            factory={"bybit":ccxt.bybit,"okx":ccxt.okx}.get(name)
-            if factory is None: raise KeyError(name)
-            self.fallback_exchanges[name]=factory({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-        return self.fallback_exchanges[name]
-
-    async def _ensure_markets(self) -> dict[str,Any]:
-        """Market list from Binance, else OKX/Bybit — a 451 block must not kill the bot."""
-        if self.markets_loaded:
-            return (self.markets_exchange or self.exchange).markets or {}
-        async with self._market_lock:
-            if self.markets_loaded:
-                return (self.markets_exchange or self.exchange).markets or {}
-            try:
-                await self.exchange.load_markets()
-                self.markets_loaded=True; self.markets_source="Binance"; self.markets_exchange=self.exchange
-                return self.exchange.markets or {}
-            except Exception as exc:
-                log.warning("Binance market list unavailable: %s",exc)
-            for name in ("okx","bybit"):
-                try:
-                    exchange=self._fallback(name)
-                    await exchange.load_markets()
-                    self.markets_loaded=True; self.markets_source=name.title(); self.markets_exchange=exchange
-                    log.info("Market list served by %s",self.markets_source)
-                    return exchange.markets
-                except Exception as exc:
-                    log.warning("Fallback %s market list failed: %s",name,exc)
-        raise UserInputError("Market list (Binance/OKX/Bybit) এখন পাওয়া যাচ্ছে না। একটু পরে চেষ্টা করুন।")
-
-    async def _fetch_ohlcv_with_fallback(self, symbol: str, timeframe: str, limit: int,
-                                         cache_key: tuple[str,str]) -> list[list[Any]]:
-        """Binance first, then Bybit/OKX. Records which source was actually used."""
-        try:
-            rows=await self.exchange.fetch_ohlcv(symbol,timeframe,limit=limit)
-            self.data_source[cache_key]="Binance"
-            return rows
-        except ccxt.BadSymbol:
-            raise                     # a wrong ticker is not a region problem
-        except Exception as primary_error:
-            log.warning("Primary exchange failed for %s %s: %s",symbol,timeframe,primary_error)
-            order=[name for name in ("okx","bybit") if name.lower()!=(self.markets_source or "").lower()]
-            if self.markets_exchange is not None and self.markets_exchange is not self.exchange:
-                try:
-                    rows=await self.markets_exchange.fetch_ohlcv(symbol,timeframe,limit=limit)
-                    if rows:
-                        self.data_source[cache_key]=self.markets_source or "Fallback"
-                        return rows
-                except Exception as exc:
-                    log.warning("Venue %s failed for %s: %s",self.markets_source,symbol,exc)
-            for name in order:
-                try:
-                    rows=await self._fallback(name).fetch_ohlcv(symbol,timeframe,limit=limit)
-                    if rows:
-                        self.data_source[cache_key]=name.title()
-                        log.info("Fallback %s served %s %s",name,symbol,timeframe)
-                        return rows
-                except Exception as exc:
-                    log.warning("Fallback %s failed for %s: %s",name,symbol,exc)
-            raise UserInputError("Binance (এবং fallback) market data এখন পাওয়া যাচ্ছে না। একটু পরে চেষ্টা করুন।") from primary_error
-
-    async def _fetch_ohlcv_page(self, symbol: str, timeframe: str, since: int) -> list[list[Any]]:
-        """One history page (max 1000 rows) from whichever venue answers."""
-        venues=[self.exchange]
-        if self.markets_exchange is not None and self.markets_exchange is not self.exchange:
-            venues.append(self.markets_exchange)
-        venues += [self._fallback("okx"), self._fallback("bybit")]
-        last_error: Exception | None = None
-        for venue in venues:
-            try:
-                batch=await venue.fetch_ohlcv(symbol,timeframe,since=since,limit=1000)
-                if batch: return batch
-            except ccxt.BadSymbol:
-                raise
-            except Exception as exc:
-                last_error=exc
-                log.warning("History page via %s failed: %s",type(venue).__name__,exc)
-        raise UserInputError("History data (Binance/OKX/Bybit) পাওয়া যাচ্ছে না।") \
-            if last_error is None else UserInputError(
-                "History data এখন পাওয়া যাচ্ছে না। একটু পরে চেষ্টা করুন।")
-
     async def fetch_candles(self, request: Request, force: bool = False) -> pd.DataFrame:
         cache_key=f"ohlcv:{request.symbol}:{request.timeframe}:{CANDLE_LIMIT}"
         cached=None if force else self.cache.get(cache_key)
         if cached is not None:
             return cached.copy(deep=True)
-        markets = await self._ensure_markets()
-        market = markets.get(request.symbol)
+        if not self.markets_loaded:
+            async with self._market_lock:
+                if not self.markets_loaded:
+                    await self.exchange.load_markets()
+                    self.markets_loaded = True
+        market = self.exchange.markets.get(request.symbol)
         if not market or not market.get("spot") or not market.get("active", True):
-            venue = self.markets_source or "Binance"
-            raise UserInputError(f"{venue} Spot-এ {request.symbol} pair পাওয়া যায়নি।")
+            raise UserInputError(f"Binance Spot-এ {request.symbol} pair পাওয়া যায়নি।")
         try:
-            # Binance first; Bybit/OKX keep the bot alive when Binance is blocked.
-            rows = await self._fetch_ohlcv_with_fallback(request.symbol, request.timeframe, CANDLE_LIMIT,
-                                                         (request.symbol,request.timeframe))
-        except UserInputError:
-            raise
+            rows = await self.exchange.fetch_ohlcv(request.symbol, request.timeframe, limit=CANDLE_LIMIT)
         except ccxt.BadSymbol as exc:
             raise UserInputError(f"Ticker {request.symbol} সঠিক নয়।") from exc
         except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
-            log.warning("Market data error: %s", exc)
-            raise UserInputError("Market data এখন পাওয়া যাচ্ছে না। একটু পরে চেষ্টা করুন।") from exc
+            log.warning("Binance error: %s", exc)
+            raise UserInputError("Binance market data এখন পাওয়া যাচ্ছে না। একটু পরে চেষ্টা করুন।") from exc
         # Binance normally includes the currently forming candle. Exclude it so
         # a wick/intrabar move can never be mislabeled as a confirmed breakout.
         rows = rows[:-1]
@@ -1309,66 +600,16 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         self.cache.set(cache_key,frame.copy(deep=True),ttl)
         return frame
 
-    async def fetch_history(self, symbol: str, timeframe: str, target: int = 1200) -> pd.DataFrame:
-        """Paginated OHLCV for backtests. CANDLE_LIMIT is left alone on purpose.
-
-        Binance returns at most 1000 candles per request, so a 5000-candle
-        backtest needs a few polite requests instead of one tiny sample.
-        """
-        target=max(200,min(int(target),5000))
-        markets=await self._ensure_markets()
-        market=markets.get(symbol)
-        if not market or not market.get("spot") or not market.get("active",True):
-            raise UserInputError(f"{self.markets_source or 'Binance'} Spot-এ {symbol} pair পাওয়া যায়নি।")
-        tf_ms=int(timeframe_delta(timeframe).total_seconds()*1000)
-        now_ms=int(time.time()*1000)
-        since=now_ms-target*tf_ms
-        rows: list[list[Any]]=[]
-        try:
-            while len(rows)<target and since<now_ms:
-                batch=await self._fetch_ohlcv_page(symbol,timeframe,since)
-                if not batch: break
-                rows.extend(batch)
-                next_since=int(batch[-1][0])+tf_ms
-                if next_since<=since: break
-                since=next_since
-                if since>=now_ms-tf_ms: break
-                await asyncio.sleep(0.25)     # rate-limit friendly
-        except (ccxt.BadSymbol,) as exc:
-            raise UserInputError(f"Ticker {symbol} সঠিক নয়।") from exc
-        except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
-            if not rows:
-                log.warning("History fetch failed for %s: %s",symbol,exc)
-                raise UserInputError("Market history এখন পাওয়া যাচ্ছে না। একটু পরে চেষ্টা করুন।") from exc
-        unique={int(row[0]):row for row in rows}
-        # Keep only candles that have fully closed at `now_ms`; anything newer is
-        # still forming and would poison a backtest with a live candle.
-        ordered=[unique[key] for key in sorted(unique)
-                 if int(key)+tf_ms<=int(time.time()*1000)]
-        if len(ordered)<200:
-            raise UserInputError("এই pair/timeframe-এর পর্যাপ্ত history পাওয়া যায়নি।")
-        frame=pd.DataFrame(ordered,columns=["timestamp","Open","High","Low","Close","Volume"])
-        frame.index=pd.to_datetime(frame.pop("timestamp"),unit="ms",utc=True)
-        return frame.astype(float)
-
     async def fetch_live_price(self, symbol: str) -> dict[str,Any]:
         """Fetch an uncached Binance ticker for display; never confirms a signal."""
-        venues=[self.exchange]
-        if self.markets_exchange is not None and self.markets_exchange is not self.exchange:
-            venues.append(self.markets_exchange)
-        else:
-            venues += [self._fallback("okx"), self._fallback("bybit")]
-        for index,venue in enumerate(venues):
-            try:
-                ticker=await venue.fetch_ticker(symbol)
-                price=float(ticker.get("last") or ticker.get("close") or 0)
-                if price<=0: raise ValueError("empty ticker")
-                return {"price":price,"bid":ticker.get("bid"),"ask":ticker.get("ask"),
-                        "timestamp":ticker.get("timestamp")}
-            except Exception as exc:
-                log.warning("Live ticker via %s failed for %s: %s",
-                            "primary" if index==0 else type(venue).__name__,symbol,exc)
-        return {}
+        try:
+            ticker=await self.exchange.fetch_ticker(symbol)
+            price=float(ticker.get("last") or ticker.get("close") or 0)
+            if price<=0: raise ValueError("empty ticker")
+            return {"price":price,"bid":ticker.get("bid"),"ask":ticker.get("ask"),"timestamp":ticker.get("timestamp")}
+        except Exception as exc:
+            log.warning("Live ticker unavailable for %s: %s",symbol,exc)
+            return {}
 
     async def external_context(self, request: Request, all_market: bool = False) -> dict[str, Any]:
         """Best-effort public futures context and reputable RSS headlines.
@@ -1378,43 +619,20 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         """
         ticker = request.symbol.replace("/", "")
         timeout = aiohttp.ClientTimeout(total=10)
-        context: dict[str, Any] = {"funding_rate": None, "open_interest": None, "news": [], "news_status": "unavailable",
-                                   "open_interest_change_pct": {}, "long_short_ratio": None,
-                                   "taker_buy_sell_ratio": None, "price_change_24h_pct": None,
-                                   "oi_price_read": "unavailable", "futures_status": "unavailable"}
+        context: dict[str, Any] = {"funding_rate": None, "open_interest": None, "news": [], "news_status": "unavailable"}
         headers = {"User-Agent": "CryptoAnalystBot/1.0"}
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async def get_json(url: str, params: dict[str, str]) -> Any:
                     async with session.get(url, params=params) as response:
                         response.raise_for_status(); return await response.json()
-                # Free Binance futures endpoints (no key): funding, OI, OI history,
-                # positioning and taker flow. Each one degrades on its own.
                 futures = await asyncio.gather(
                     get_json("https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": ticker}),
                     get_json("https://fapi.binance.com/fapi/v1/openInterest", {"symbol": ticker}),
-                    get_json("https://fapi.binance.com/futures/data/openInterestHist",
-                             {"symbol": ticker, "period": "1h", "limit": "25"}),
-                    get_json("https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-                             {"symbol": ticker, "period": "1h", "limit": "1"}),
-                    get_json("https://fapi.binance.com/futures/data/takerlongshortRatio",
-                             {"symbol": ticker, "period": "1h", "limit": "1"}),
-                    get_json("https://fapi.binance.com/fapi/v1/ticker/24hr", {"symbol": ticker}),
                     return_exceptions=True,
                 )
                 if isinstance(futures[0], dict): context["funding_rate"] = float(futures[0].get("lastFundingRate", 0))
                 if isinstance(futures[1], dict): context["open_interest"] = float(futures[1].get("openInterest", 0))
-                oi_history = parse_open_interest_history(futures[2])
-                if oi_history: context["open_interest_change_pct"] = oi_history
-                context["long_short_ratio"] = parse_ratio_field(futures[3], "longShortRatio")
-                context["taker_buy_sell_ratio"] = parse_ratio_field(futures[4], "buySellRatio")
-                if isinstance(futures[5], dict) and futures[5].get("priceChangePercent") is not None:
-                    try: context["price_change_24h_pct"] = float(futures[5]["priceChangePercent"])
-                    except (TypeError, ValueError): pass
-                context["oi_price_read"] = oi_price_signal(context["price_change_24h_pct"],
-                                                           (oi_history or {}).get("24h"))
-                context["futures_status"] = ("live" if (context["funding_rate"] is not None
-                                                        or oi_history) else "unavailable")
                 # Multiple independent, free RSS desks improve recency and coin coverage.
                 # A failed/paywalled source is ignored and never blocks the analysis.
                 feeds={
@@ -1463,33 +681,7 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
                 context["news_status"] = "live_rss" if context["news"] else "no_relevant_headlines"
         except Exception as exc:
             log.warning("External context unavailable: %s", exc)
-        try:
-            context["sentiment"] = await self.market_sentiment()
-        except Exception as exc:
-            log.warning("Sentiment unavailable: %s", exc)
-            context["sentiment"] = {"status": "unavailable"}
         return context
-
-    async def market_sentiment(self) -> dict[str,Any]:
-        """Fear & Greed + BTC dominance, cached for an hour (free APIs)."""
-        cached=self.cache.get("sentiment:global")
-        if cached is not None: return cached
-        result: dict[str,Any]={"fear_greed":None,"btc_dominance":None,"eth_dominance":None,
-                               "market_cap_change_24h":None,"status":"unavailable"}
-        fear,global_market=await asyncio.gather(http_json(FEAR_GREED_URL),
-                                                http_json(GLOBAL_MARKET_URL),
-                                                return_exceptions=True)
-        if not isinstance(fear,Exception):
-            parsed=parse_fear_greed(fear)
-            if parsed: result["fear_greed"]=parsed; result["status"]="live"
-        if not isinstance(global_market,Exception):
-            parsed=parse_coingecko_global(global_market)
-            if parsed:
-                result.update(parsed); result["status"]="live"
-        # Cache only successful reads so a temporary outage retries next time.
-        if result["status"]=="live":
-            self.cache.set("sentiment:global",result,ttl=3600)
-        return result
 
     async def higher_timeframe(self, request: Request) -> dict[str, Any]:
         order=["15m","1h","4h","1d","1w"]
@@ -1514,36 +706,13 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         except Exception as exc:
             log.warning("Market filter unavailable: %s",exc); return {}
 
-    async def multi_timeframe(self, request: Request) -> dict[str,Any]:
-        """15m/1h/4h/1d agreement for the same symbol (candles are cached)."""
-        frames=await asyncio.gather(*(self.fetch_candles(Request(request.symbol,tf))
-                                      for tf in MTF_TIMEFRAMES),return_exceptions=True)
-        per: dict[str,dict[str,Any]]={}
-        for tf,frame in zip(MTF_TIMEFRAMES,frames):
-            if isinstance(frame,Exception):
-                log.warning("MTF %s unavailable: %s",tf,frame); per[tf]={"status":"unavailable"}; continue
-            try:
-                quant=quant_snapshot(frame.copy(deep=True))
-                per[tf]={"structure":quant["structure"],"rsi":quant["rsi"],
-                         "above_ema50":quant["last"]>quant["ema50"],"state":quant["breakout"]["state"]}
-            except Exception:
-                per[tf]={"status":"unavailable"}
-        return mtf_confluence(per)
-
-    async def analyze(self, request: Request, frame: pd.DataFrame, detail_mode: str = "standard", live: dict[str,Any] | None = None, language: str = "bn") -> dict[str, Any]:
+    async def analyze(self, request: Request, frame: pd.DataFrame, detail_mode: str = "standard", live: dict[str,Any] | None = None) -> dict[str, Any]:
         quant = quant_snapshot(frame)
         live=live or {}
         quant["live_price"]=live.get("price")
         quant["last_closed_price"]=float(frame.Close.iloc[-1])
         quant["last_closed_time"]=frame.index[-1].isoformat()
-        # Professional mode also asks 15m/1h/4h/1d for a confluence score; the
-        # extra candle calls come from the cache after the first run.
-        tasks=[self.external_context(request), self.higher_timeframe(request), self.market_filter(request.timeframe)]
-        if detail_mode=="professional": tasks.append(self.multi_timeframe(request))
-        results=await asyncio.gather(*tasks)
-        context, higher, market = results[0], results[1], results[2]
-        mtf = results[3] if len(results)>3 else None
-        if mtf: quant["mtf_confluence"]=mtf
+        context, higher, market = await asyncio.gather(self.external_context(request), self.higher_timeframe(request), self.market_filter(request.timeframe))
         quant["retest"]=retest_state(frame,quant["breakout"])
         quant["explainable_score"]=explainable_score(quant,higher,market,context)
         quant["data_quality"]=data_quality(len(frame),higher,context,market)
@@ -1565,58 +734,40 @@ Requested report mode: {detail_mode}. {detail_instruction}
 Do not replace or recalculate these levels. LIVE_PRICE is the current uncached ticker, while LAST_CLOSED_PRICE/TIME is the confirmed candle used for indicators and signals. Clearly distinguish them; never describe the closed price as current. Explain structure, RSI, MACD, EMAs, Bollinger position, volume, S1-S3/R1-R3, invalidation and two conditional scenarios in Bengali. Include an educational risk warning.
 QUANT: {json.dumps(quant, separators=(',', ':'))}
 HIGHER_TIMEFRAME: {json.dumps(higher, separators=(',', ':'))}
-MULTI_TIMEFRAME_CONFLUENCE: {json.dumps(mtf or {}, separators=(',', ':'))}
 BTC_ETH_MARKET_FILTER: {json.dumps(market, separators=(',', ':'))}
 PUBLIC_FUTURES_AND_RSS_CONTEXT: {json.dumps(context, ensure_ascii=False, separators=(',', ':'))}
 RECENT_OHLCV: {json.dumps(candles[-60:], separators=(',', ':'))}
 Explain whether a breakout/breakdown already happened, is approaching, or is unconfirmed. State both trigger prices, candle-close/volume/body confirmation, false-breakout risk, estimated candle window (never an exact promise), higher-timeframe alignment, funding/OI when available, and summarize only the supplied live headlines. A setup score is not a probability. Never claim certainty.
-OUTPUT_LANGUAGE: {language_instruction(language)}
 Return supports={supports}, resistances={resistances}, trendlines={quant['trendlines']} exactly."""
         try:
             data = await self._gemini_json(self.analysis_model, prompt, REQUEST_SCHEMA)
             analysis = str(data["analysis_bn"]).strip()
         except UserInputError:
             # The bot remains useful when Gemini is unavailable or quota-limited.
-            # Both language variants keep the same numbers, only the wording differs.
-            base = (f"📌 Python fallback analysis\nMarket structure: {quant['structure']}\n"
-                    f"RSI(14): {quant['rsi']:.2f} | MACD: {quant['macd']:.6g}\n"
-                    f"EMA20/50/200: {quant['ema20']:.6g} / {quant['ema50']:.6g} / {quant['ema200']:.6g}\n"
-                    f"ATR(14): {quant['atr']:.6g} | Volume ratio: {quant['volume_ratio']:.2f}x\n"
-                    f"Support: {', '.join(f'{x:.8g}' for x in supports)}\n"
-                    f"Resistance: {', '.join(f'{x:.8g}' for x in resistances)}\n\n"
-                    f"Breakout status: {quant['breakout']['state']}\n"
-                    f"Bullish trigger: {quant['breakout']['bullish_trigger']:.8g} | Bearish trigger: {quant['breakout']['bearish_trigger']:.8g}\n"
-                    f"Setup score (not a probability): bullish {quant['breakout']['bullish_setup_score']}/100, bearish {quant['breakout']['bearish_setup_score']}/100\n")
-            if is_english(language):
-                analysis = base + (f"Estimated window: upside {quant['breakout']['estimated_candles_to_up']} candles, downside {quant['breakout']['estimated_candles_to_down']} candles. Not a guaranteed timing.\n\n"
-                                   "This is an automated educational analysis, not financial advice.")
-            else:
-                analysis = base + (f"আনুমানিক window: upside {quant['breakout']['estimated_candles_to_up']} candle, downside {quant['breakout']['estimated_candles_to_down']} candle। নিশ্চিত সময় নয়।\n\n"
-                                   "এটি স্বয়ংক্রিয় শিক্ষামূলক বিশ্লেষণ, আর্থিক পরামর্শ নয়।")
+            analysis = (f"📌 Python fallback analysis\nMarket structure: {quant['structure']}\n"
+                        f"RSI(14): {quant['rsi']:.2f} | MACD: {quant['macd']:.6g}\n"
+                        f"EMA20/50/200: {quant['ema20']:.6g} / {quant['ema50']:.6g} / {quant['ema200']:.6g}\n"
+                        f"ATR(14): {quant['atr']:.6g} | Volume ratio: {quant['volume_ratio']:.2f}x\n"
+                        f"Support: {', '.join(f'{x:.8g}' for x in supports)}\n"
+                        f"Resistance: {', '.join(f'{x:.8g}' for x in resistances)}\n\n"
+                        f"Breakout status: {quant['breakout']['state']}\n"
+                        f"Bullish trigger: {quant['breakout']['bullish_trigger']:.8g} | Bearish trigger: {quant['breakout']['bearish_trigger']:.8g}\n"
+                        f"Setup score (probability নয়): bullish {quant['breakout']['bullish_setup_score']}/100, bearish {quant['breakout']['bearish_setup_score']}/100\n"
+                        f"আনুমানিক window: upside {quant['breakout']['estimated_candles_to_up']} candle, downside {quant['breakout']['estimated_candles_to_down']} candle। নিশ্চিত সময় নয়।\n\n"
+                        "এটি স্বয়ংক্রিয় শিক্ষামূলক বিশ্লেষণ, আর্থিক পরামর্শ নয়।")
         return {"analysis_bn": analysis, "supports": supports, "resistances": resistances,
                 "trendlines": quant["trendlines"], "support_zones": quant["supports"],
                 "resistance_zones": quant["resistances"], "quant": quant,
                 "external_context": context, "higher_timeframe": higher, "market_filter": market}
 
     @staticmethod
-    def chart(frame: pd.DataFrame, request: Request, result: dict[str, Any],
-              detail_mode: str = "standard") -> io.BytesIO:
+    def chart(frame: pd.DataFrame, request: Request, result: dict[str, Any]) -> io.BytesIO:
         style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mpf.make_marketcolors(up="#26a69a", down="#ef5350", inherit=True), gridstyle=":")
         hlines = result["supports"] + result["resistances"]
         colors = ["#20c878"] * 3 + ["#ff4d5a"] * 3
         overlays = [mpf.make_addplot(frame.EMA20, color="#42a5f5", width=1.0),
                     mpf.make_addplot(frame.EMA50, color="#ffb300", width=1.0),
                     mpf.make_addplot(frame.EMA200, color="#ab47bc", width=1.1)]
-        # VWAP is already computed by pro_quant for the report; draw the same
-        # line on the chart so text and picture cannot disagree.
-        annotations = chart_zones(result.get("quant", {}), len(frame))
-        vwap_series = None
-        try:
-            from pro_quant import add_indicators as _add_indicators
-            vwap_series = _add_indicators(frame.copy(deep=True))["VWAP"]
-            overlays.append(mpf.make_addplot(vwap_series, color="#00e5ff", width=1.0, linestyle="--"))
-        except Exception:
-            vwap_series = None   # never let an annotation break the chart
         fig, axes = mpf.plot(frame, type="candle", volume=True, style=style, figsize=(14, 8), addplot=overlays,
                              title=f"\n{request.symbol} • {request.timeframe} • Binance Spot",
                              ylabel="Price (USDT)", ylabel_lower="Volume",
@@ -1660,33 +811,6 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
                         arrowprops={"arrowstyle":"-","color":item["edge"],"lw":.8,"alpha":.8},
                         bbox={"boxstyle":"round,pad=.22","facecolor":item["face"],"edgecolor":item["edge"],"alpha":.92})
 
-        # ---- professional annotations (FVG / OB / volume profile / sweeps) ----
-        try:
-            rich = detail_mode == "professional"
-            right_edge = len(frame) - 1
-            for zone in (annotations["fair_value_gaps"] if rich else []):
-                start = max(0, min(zone["start"], right_edge)); end = max(start + 1, min(zone["end"], right_edge + 1))
-                color = "#1de9b6" if zone["type"].startswith("BULLISH") else "#ff5252"
-                ax.fill_between([start, end], zone["low"], zone["high"], color=color,
-                                alpha=.07 if zone.get("mitigated") else .16, linewidth=0)
-            for zone in (annotations["order_blocks"] if rich else []):
-                start = max(0, min(zone["start"], right_edge)); end = min(zone["end"], right_edge + 1)
-                color = "#64b5f6" if zone["type"].startswith("BULLISH") else "#ba68c8"
-                ax.fill_between([start, end], zone["low"], zone["high"], color=color, alpha=.14, linewidth=0)
-            for sweep in (annotations["sweeps"] if rich else []):
-                ax.scatter([sweep["idx"]], [sweep["price"]], marker="x", s=26,
-                           color="#ffd54f" if sweep["type"] == "HIGH_SWEEP" else "#ffd54f", zorder=5)
-            levels = annotations["levels"]
-            for key, label, color, style in (("poc", "POC", "#ffe082", ":"),
-                                             ("vah", "VAH", "#ffcc80", (0, (4, 3))),
-                                             ("val", "VAL", "#ffcc80", (0, (4, 3)))):
-                value = levels.get(key)
-                if value:
-                    ax.axhline(float(value), color=color, linewidth=.9, linestyle=style, alpha=.85)
-                    ax.plot([], [], color=color, linestyle=style, label=f"{label} {float(value):.8g}")
-        except Exception:
-            log.warning("Chart annotations skipped for %s", request.symbol, exc_info=True)
-
         for n, line in enumerate(result["trendlines"], 1):
             ax.plot([line["start_idx"], line["end_idx"]], [line["start_val"], line["end_val"]], color="#42a5f5", linewidth=1.6, linestyle="--", label="Trendline" if n == 1 else None)
         # Legend and exact latest closed-candle OHLC values.
@@ -1710,19 +834,6 @@ BOT: AnalystBot | None = None
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     await BOT.ensure_user(update)
-    notices=[]
-    if context.args:
-        referrer=await BOT.register_referral(update.effective_user.id,context.args[0])
-        if referrer: notices.append("🎁 আপনি একটি invite link দিয়ে এসেছেন।")
-    if await BOT.grant_trial(update.effective_user.id):
-        notices.append(f"🎁 আপনার {TRIAL_DAYS} দিনের free trial শুরু হয়েছে — সব Pro feature খোলা আছে।")
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(admin_id,
-                    f"🎁 নতুন user trial শুরু করেছে\nID: <code>{update.effective_user.id}</code>\n"
-                    f"Username: @{html.escape(update.effective_user.username or 'none')}",
-                    parse_mode=ParseMode.HTML)
-            except Exception: log.warning("Trial notice to admin %s failed",admin_id)
     plan=await BOT.effective_plan(update.effective_user.id)
     await set_user_menu(context.bot,update.effective_user.id,plan)
     if plan not in {"pro","admin"}:
@@ -1738,19 +849,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<i>Educational analysis only — not financial advice.</i>",
         parse_mode=ParseMode.HTML,
     )
-    if notices:
-        await update.effective_message.reply_text("\n".join(notices))
-
-def parse_trx_id(raw: str) -> str | None:
-    """Normalise a bKash/Nagad Transaction ID, or None when it looks invalid.
-
-    Kept deliberately lenient (6-64 chars, letters+digits, dashes/spaces
-    stripped) because carriers print the ID in slightly different shapes.
-    """
-    cleaned=re.sub(r"[\s\-]+","",str(raw or "")).upper()
-    if not cleaned or len(cleaned)<6 or len(cleaned)>64: return None
-    return cleaned if re.fullmatch(r"[A-Z0-9]+",cleaned) else None
-
 
 def plan_text(plan: str) -> str:
     title={"free":"Free Plan","pro":"Pro Plan","admin":"Admin Access"}[plan]
@@ -1837,9 +935,7 @@ async def deny_unapproved(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # NOTE: `context` is used below (notify_new_user). The previous `del context`
-    # raised NameError for every free user who opened /help.
-    assert BOT is not None
+    del context; assert BOT is not None
     await BOT.ensure_user(update); plan=await BOT.effective_plan(update.effective_user.id)
     if plan=="free":
         await BOT.notify_new_user(update,context)
@@ -1847,20 +943,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     common=("কীভাবে ব্যবহার করবেন\n\nCoin analysis: BTC 4H অথবা বাংলা/English voice note\n"
             "/history SUI 4h — আগের breakout events\n/risk 65000 63000 1000 1 — position size\n"
             "/alert SUI 4h confirmed — smart alert\n/alerts — active alerts\n/watchlist SUI — watchlist\n"
-            "/settings — report ও confirmation mode\n/timezone Asia/Dhaka — local time\n"
-            "/level BTC 70000 — দাম এই level ছুঁলে জানাবে\n/level list — active levels\n"
-            "/portfolio — নিজের holdings ও live PnL\n/portfolio add BTC 0.5 65000 — যোগ করুন\n"
-            "/invite — নিজের invite link ও reward\n/trial — একবারের free trial\n"
-            "/paid — USDT (TRC20) ঠিকানা ও TXID যাচাই")
+            "/settings — report ও confirmation mode\n/timezone Asia/Dhaka — local time")
     extra=""
-    if plan in {"pro","admin"}: extra=("\n/scanner 4h — top market candidates\n"
-                                       "/backtest BTC 4h 1200 — fee/slippage সহ backtest\n"
-                                       "/mtf BTC — 15m/1h/4h/1d confluence\n"
-                                       "/scorecard 30 — নিজের signal-এর hit rate\n"
-                                       "Professional report mode ব্যবহার করতে পারবেন।")
-    if plan=="admin": extra += ("\n/stats — system statistics\n/health — system health\n"
-                                "/report — daily market report এখনই\n/referrals — invite report\n"
-                                "/approve USER_ID DAYS — subscription approve")
+    if plan in {"pro","admin"}: extra="\n/scanner 4h — top market candidates\n/backtest BTC 4h — research backtest\nProfessional report mode ব্যবহার করতে পারবেন।"
+    if plan=="admin": extra += "\n/stats — system statistics\n/health — system health\n/approve USER_ID DAYS — subscription approve"
     await send_long(update.effective_message,common+extra+"\n\n"+plan_text(plan))
 
 
@@ -2045,7 +1131,7 @@ def make_pine_script(symbol: str,timeframe: str,frame: pd.DataFrame,result: dict
     return "\n".join(lines)+"\n"
 
 
-def comparison_text(previous: Any,current: dict[str,Any],language: str = "bn") -> str:
+def comparison_text(previous: Any,current: dict[str,Any]) -> str:
     if not previous: return ""
     try:
         old=json.loads(previous) if isinstance(previous,str) else previous; changes=[]
@@ -2055,48 +1141,38 @@ def comparison_text(previous: Any,current: dict[str,Any],language: str = "bn") -
             if abs(after-before)>.01: changes.append(f"{label}: {before:.2f} → {after:.2f}{suffix}")
         old_dist=old.get("breakout",{}).get("distance_to_bullish_pct"); new_dist=current["breakout"].get("distance_to_bullish_pct")
         if old_dist is not None and new_dist is not None: changes.append(f"Bull trigger distance: {float(old_dist):.2f}% → {float(new_dist):.2f}%")
-        header = "\n\nChanges since the previous analysis\n" if is_english(language) else "\n\nPrevious analysis থেকে পরিবর্তন\n"
-        return header+"\n".join(f"• {x}" for x in changes[:5]) if changes else ""
+        return "\n\nPrevious analysis থেকে পরিবর্তন\n"+"\n".join(f"• {x}" for x in changes[:5]) if changes else ""
     except Exception: return ""
 
 
-def quick_report(request: Request, result: dict[str,Any], language: str = "bn") -> str:
-    q=result["quant"]; b=q["breakout"]; head="অবস্থা" if not is_english(language) else "State"
-    tail=("Confirmation: candle close, volume এবং candle body প্রয়োজন।\n\nএটি আর্থিক পরামর্শ নয়।"
-          if not is_english(language) else
-          "Confirmation needs a closed candle, volume and body strength.\n\nThis is not financial advice.")
+def quick_report(request: Request, result: dict[str,Any]) -> str:
+    q=result["quant"]; b=q["breakout"]
     return (f"{request.symbol} — {request.timeframe}\n\n"
-            f"{head}: {b['state']}\nMarket structure: {q['structure']}\n"
+            f"অবস্থা: {b['state']}\nMarket structure: {q['structure']}\n"
             f"Bullish trigger: {b['bullish_trigger']:.8g}\nBearish trigger: {b['bearish_trigger']:.8g}\n"
             f"Bullish setup strength: {b['bullish_setup_score']}/100\nBearish setup strength: {b['bearish_setup_score']}/100\n"
-            f"RSI: {q['rsi']:.2f}\nVolume: {b['volume_ratio']:.2f}x\n{tail}")
+            f"RSI: {q['rsi']:.2f}\nVolume: {b['volume_ratio']:.2f}x\n"
+            f"Confirmation: candle close, volume এবং candle body প্রয়োজন।\n\nএটি আর্থিক পরামর্শ নয়।")
 
 
 async def run_request(update: Update, request: Request) -> None:
     assert BOT is not None
     message = update.effective_message
-    # The saved language drives the wrapper texts too (status/caption/errors);
-    # otherwise an English report arrived inside Bengali chrome.
-    settings=await BOT.user_settings(update.effective_user.id if update.effective_user else None)
-    language=settings.get("language","bn")
-    request.language=language
-    status_text = (f"⏳ Analyzing {html.escape(request.symbol)} • {html.escape(request.timeframe)}…"
-                   if is_english(language) else
-                   f"⏳ {html.escape(request.symbol)} • {html.escape(request.timeframe)} বিশ্লেষণ করছি…")
-    status = await message.reply_text(status_text, parse_mode=ParseMode.HTML)
+    status = await message.reply_text(f"⏳ {html.escape(request.symbol)} • {html.escape(request.timeframe)} বিশ্লেষণ করছি…", parse_mode=ParseMode.HTML)
     try:
         async with BOT.semaphore:
             await message.chat.send_action(ChatAction.TYPING)
             frame,live = await asyncio.gather(BOT.fetch_candles(request),BOT.fetch_live_price(request.symbol))
+            settings=await BOT.user_settings(update.effective_user.id if update.effective_user else None)
             detail_mode=requested_detail_mode(request.transcript,settings["detail_mode"])
-            result = await BOT.analyze(request, frame, detail_mode=detail_mode,live=live,language=language)
+            result = await BOT.analyze(request, frame, detail_mode=detail_mode,live=live)
             apply_confirmation_mode(result,settings["risk_mode"])
             if detail_mode=="quick":
-                result["analysis_bn"]=quick_report(request,result,language=language)
+                result["analysis_bn"]=quick_report(request,result)
             if BOT.db and update.effective_user:
                 await BOT.ensure_user(update)
                 previous=await BOT.db.fetchval("SELECT payload FROM analyses WHERE telegram_id=$1 AND symbol=$2 AND timeframe=$3 ORDER BY created_at DESC LIMIT 1",update.effective_user.id,request.symbol,request.timeframe)
-                result["analysis_bn"] += comparison_text(previous,result["quant"],language=language)
+                result["analysis_bn"] += comparison_text(previous,result["quant"])
                 await BOT.db.execute("INSERT INTO analyses(telegram_id,symbol,timeframe,state,price,payload) VALUES($1,$2,$3,$4,$5,$6::jsonb)",
                     update.effective_user.id,request.symbol,request.timeframe,result["quant"]["breakout"]["state"],float(frame.Close.iloc[-1]),json.dumps(result["quant"]))
             # Cache a ready-to-paste Pine script for the chart button.
@@ -2104,36 +1180,24 @@ async def run_request(update: Update, request: Request) -> None:
             pine_key=f"pine:{update.effective_user.id if update.effective_user else 0}:{request.symbol}:{request.timeframe}"
             BOT.cache.set(pine_key,pine,ttl=86400)
             # Matplotlib is CPU-bound and not thread-safe; render promptly in event thread.
-            image = BOT.chart(frame, request, result, detail_mode=detail_mode)
-        source=BOT.data_source.get((request.symbol,request.timeframe),"Binance") if BOT else "Binance"
-        source_line="" if source=="Binance" else f"⚠️ Data source: {source} (Binance unavailable)\n"
+            image = BOT.chart(frame, request, result)
         bo = result["quant"]["breakout"]
-        english=is_english(language)
-        state_bn=colored_state(bo['state'],bengali=not english)
+        state_bn=colored_state(bo['state'],bengali=True)
         live_price=result["quant"].get("live_price")
-        if english:
-            live_line=f"Binance live price: {live_price:.10g} USDT\n" if live_price else "Binance live price: temporarily unavailable\n"
-            caption = (f"📊 {request.symbol} • {request.timeframe.upper()}\n"
-                       f"{source_line}{live_line}Last closed candle: {frame.Close.iloc[-1]:.10g} USDT ({frame.index[-1].strftime('%d %b %Y %H:%M UTC')})\n"
-                       f"Current state: {state_bn}\n"
-                       f"Bullish trigger: {bo['bullish_trigger']:.8g}\nBearish trigger: {bo['bearish_trigger']:.8g}\n"
-                       f"The full explanation is in the next message.")
-        else:
-            live_line=f"বর্তমান Binance price: {live_price:.10g} USDT\n" if live_price else "বর্তমান Binance price: সাময়িকভাবে unavailable\n"
-            caption = (f"📊 {request.symbol} • {request.timeframe.upper()}\n"
-                       f"{source_line}{live_line}শেষ বন্ধ candle: {frame.Close.iloc[-1]:.10g} USDT ({frame.index[-1].strftime('%d %b %Y %H:%M UTC')})\n"
-                       f"বর্তমান অবস্থা: {state_bn}\n"
-                       f"উপরের ট্রিগার: {bo['bullish_trigger']:.8g}\nনিচের ট্রিগার: {bo['bearish_trigger']:.8g}\n"
-                       f"সম্পূর্ণ ব্যাখ্যা নিচের বার্তায় দেওয়া হয়েছে।")
+        live_line=f"বর্তমান Binance price: {live_price:.10g} USDT\n" if live_price else "বর্তমান Binance price: সাময়িকভাবে unavailable\n"
+        caption = (f"📊 {request.symbol} • {request.timeframe.upper()}\n"
+                   f"{live_line}শেষ বন্ধ candle: {frame.Close.iloc[-1]:.10g} USDT ({frame.index[-1].strftime('%d %b %Y %H:%M UTC')})\n"
+                   f"বর্তমান অবস্থা: {state_bn}\n"
+                   f"উপরের ট্রিগার: {bo['bullish_trigger']:.8g}\nনিচের ট্রিগার: {bo['bearish_trigger']:.8g}\n"
+                   f"সম্পূর্ণ ব্যাখ্যা নিচের বার্তায় দেওয়া হয়েছে।")
         await message.reply_photo(photo=image, caption=caption, reply_markup=analysis_keyboard(request.symbol, request.timeframe))
-        prefix = (f"🎙️ Heard: {request.transcript}\n\n" if english else f"🎙️ শুনেছি: {request.transcript}\n\n") if request.transcript and message.voice else ""
+        prefix = f"🎙️ শুনেছি: {request.transcript}\n\n" if request.transcript and message.voice else ""
         await send_long(message, prefix + result["analysis_bn"])
     except UserInputError as exc:
         await message.reply_text(f"⚠️ {html.escape(str(exc))}", parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("Unhandled analysis failure for user=%s", update.effective_user.id if update.effective_user else None)
-        await message.reply_text("❌ An unexpected error occurred. Please try again in a moment." if is_english(locals().get("language","bn"))
-                                 else "❌ অপ্রত্যাশিত ত্রুটি হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।")
+        await message.reply_text("❌ অপ্রত্যাশিত ত্রুটি হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।")
     finally:
         try:
             await status.delete()
@@ -2446,8 +1510,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 kb=InlineKeyboardMarkup([[InlineKeyboardButton("Pending Requests",callback_data="admpending"),InlineKeyboardButton("Users",callback_data="adminusers")],[InlineKeyboardButton("System Health",callback_data="adminhealth")]])
                 await q.message.reply_text("Admin Panel",reply_markup=kb); return
             if data=="admpending":
-                rows=await BOT.db.fetch("SELECT id,telegram_id,days,transaction_id FROM subscription_requests WHERE status='pending' ORDER BY id DESC LIMIT 20")
-                buttons=[[InlineKeyboardButton(f"#{r['id']} • {r['telegram_id']} • {r['days']}d" + (" • TrxID ✓" if r['transaction_id'] else " • TrxID ✗"),callback_data=f"admreq|{r['id']}")] for r in rows]
+                rows=await BOT.db.fetch("SELECT id,telegram_id,days FROM subscription_requests WHERE status='pending' ORDER BY id DESC LIMIT 20")
+                buttons=[[InlineKeyboardButton(f"#{r['id']} • {r['telegram_id']} • {r['days']}d",callback_data=f"admreq|{r['id']}")] for r in rows]
                 buttons.append([InlineKeyboardButton("← Admin",callback_data="adminhome")])
                 await q.message.reply_text("Pending requests" if rows else "Pending request নেই।",reply_markup=InlineKeyboardMarkup(buttons)); return
             if data=="adminusers":
@@ -2462,8 +1526,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 if not r: await q.message.reply_text("Request পাওয়া যায়নি।"); return
                 approve_cmd=f"/approve {r['telegram_id']} {r['days']}"
                 kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{r['id']}")],[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(r['telegram_id']))),InlineKeyboardButton("📋 Copy command",copy_text=CopyTextButton(approve_cmd))]])
-                trx=html.escape(r['transaction_id']) if r['transaction_id'] else "এখনো দেওয়া হয়নি"
-                await q.message.reply_text(f"Request #{r['id']}\nUser: <code>{r['telegram_id']}</code>\nPlan: {r['plan_code']} ({r['days']} দিন)\nTrxID: <b>{trx}</b>\nStatus: {r['status']}",reply_markup=kb,parse_mode=ParseMode.HTML); return
+                await q.message.reply_text(f"Request #{r['id']}\nUser: <code>{r['telegram_id']}</code>\nDays: {r['days']}\nStatus: {r['status']}",reply_markup=kb,parse_mode=ParseMode.HTML); return
             if parts[0]=="admacc" and len(parts)==2:
                 r=await BOT.db.fetchrow("SELECT * FROM subscription_requests WHERE id=$1 AND status='pending'",int(parts[1]))
                 if not r: await q.message.reply_text("Request pending নেই।"); return
@@ -2579,9 +1642,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if data=="myplan":
             plan=await BOT.effective_plan(update.effective_user.id)
             await q.message.reply_text(plan_text(plan)); return
-        if parts[0]=="subreqskip":
-            # Stale button pressed after the TrxID conversation already ended.
-            await q.message.reply_text("এই বাটনটির সময় শেষ। আবার /subscribe দিয়ে নতুন করে request করুন।"); return
         if parts[0]=="sub" and len(parts)==2:
             plan=await BOT.effective_plan(update.effective_user.id)
             if plan in {"pro","admin"}: await q.message.reply_text("আপনার subscription ইতোমধ্যে সক্রিয়। মেয়াদ শেষ না হওয়া পর্যন্ত নতুন package প্রয়োজন নেই।"); return
@@ -2590,13 +1650,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if BKASH_NUMBER: payment.append(f"bKash: {BKASH_NUMBER}")
             if NAGAD_NUMBER: payment.append(f"Nagad: {NAGAD_NUMBER}")
             pay="\n".join(payment) or "Payment number জানতে admin-এর সঙ্গে যোগাযোগ করুন।"
-            text=(f"Pro Subscription — {days} দিন\nমূল্য: {price}\n\n{plan_text('pro')}\n\nPayment\n{pay}\n\n"
-                  "Payment সম্পন্ন করে নিচের Request Approval button চাপুন — এরপর bKash/Nagad-এর "
-                  "Transaction ID (TrxID) চাওয়া হবে। TrxID দিলে admin পেমেন্ট মিলিয়ে দ্রুত approve করতে পারবেন।")
+            text=f"Pro Subscription — {days} দিন\nমূল্য: {price}\n\n{plan_text('pro')}\n\nPayment\n{pay}\n\nPayment সম্পন্ন করে নিচের Request Approval button চাপুন। Transaction ID পরে admin-কে পাঠাতে পারেন।"
             kb=InlineKeyboardMarkup([[InlineKeyboardButton("Request Approval",callback_data=f"subreq|{code}")],[contact_button()],[InlineKeyboardButton("← Packages",callback_data="subscriptions")]])
             await q.message.reply_text(text,reply_markup=kb); return
         if data=="subscriptions":
             await q.message.reply_text("Subscription plan নির্বাচন করুন:",reply_markup=subscription_keyboard()); return
+        if parts[0]=="subreq" and len(parts)==2:
+            if not BOT.db: await q.message.reply_text("Subscription request-এর জন্য DATABASE_URL প্রয়োজন।"); return
+            code=parts[1]; days=30 if code=="pro30" else 90
+            await BOT.ensure_user(update)
+            existing=await BOT.db.fetchval("SELECT id FROM subscription_requests WHERE telegram_id=$1 AND status='pending'",update.effective_user.id)
+            if existing: await q.message.reply_text(f"আপনার Request #{existing} ইতোমধ্যে pending আছে। Admin review-এর অপেক্ষা করুন।"); return
+            rid=await BOT.db.fetchval("INSERT INTO subscription_requests(telegram_id,plan_code,days) VALUES($1,$2,$3) RETURNING id",update.effective_user.id,code,days)
+            benefit=plan_text("pro")
+            await q.message.reply_text(f"✅ Subscription request #{rid} গ্রহণ করা হয়েছে।\n\nআপনি {days} দিনের Pro plan চেয়েছেন। Approval হলে এই সুবিধাগুলো পাবেন:\n\n{benefit}\n\nAdmin review করলে আপনাকে notification দেওয়া হবে।")
+            approve_cmd=f"/approve {update.effective_user.id} {days}"
+            admin_msg=(f"নতুন subscription request #{rid}\nUser: <code>{update.effective_user.id}</code> (@{html.escape(update.effective_user.username or 'none')})\n"
+                       f"Plan: Pro {days} days\nApprove command:\n<code>{approve_cmd}</code>\n\nMono command-এ tap/hold করে copy করতে পারবেন।")
+            admin_kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{rid}")],[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(update.effective_user.id))),InlineKeyboardButton("📋 Copy command",copy_text=CopyTextButton(approve_cmd))],[InlineKeyboardButton("👤 User details",callback_data=f"admuser|{update.effective_user.id}")]])
+            for admin_id in ADMIN_IDS:
+                try: await context.bot.send_message(admin_id,admin_msg,reply_markup=admin_kb,parse_mode=ParseMode.HTML)
+                except Exception: log.warning("Could not notify admin %s",admin_id)
+            return
         if parts[0]=="set" and len(parts)==3:
             if not BOT.db: await q.message.reply_text("Settings save করতে DATABASE_URL প্রয়োজন।"); return
             allowed={"detail_mode":{"quick","standard","professional"},"risk_mode":{"aggressive","balanced","conservative"},"language":{"bn","en"}}
@@ -2612,111 +1687,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception: log.exception("Callback failed"); await q.message.reply_text("এই action সম্পন্ন করা যায়নি।")
 
 
-def _subscription_ask_kb(code: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("TrxID নেই / পরে দেব",callback_data=f"subreqskip|{code}")],
-        [InlineKeyboardButton("বাতিল",callback_data="subreqcancel")],
-    ])
-
-
-async def subreq_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point: ask for the payment TrxID before creating the request."""
-    assert BOT is not None
-    q=update.callback_query; await q.answer()
-    if not BOT.db:
-        await q.message.reply_text("Subscription request-এর জন্য DATABASE_URL প্রয়োজন।"); return ConversationHandler.END
-    code=(q.data or "").split("|")[-1]
-    if code not in {"pro30","pro90"}:
-        await q.message.reply_text("Unknown package."); return ConversationHandler.END
-    await BOT.ensure_user(update)
-    existing=await BOT.db.fetchval("SELECT id FROM subscription_requests WHERE telegram_id=$1 AND status='pending'",update.effective_user.id)
-    if existing:
-        await q.message.reply_text(f"আপনার Request #{existing} ইতোমধ্যে pending আছে। Admin review-এর অপেক্ষা করুন।")
-        return ConversationHandler.END
-    context.user_data["sub_pending"]={"code":code}
-    days=30 if code=="pro30" else 90
-    await q.message.reply_text(
-        f"✍️ Pro {days} দিন — পেমেন্ট হয়ে থাকলে bKash/Nagad-এর Transaction ID (TrxID) পাঠান।\n\n"
-        "TrxID দিলে admin পেমেন্ট মিলিয়ে দ্রুত approve করতে পারবেন।\n"
-        "TrxID এখন না থাকলে নিচের বাটন চাপুন — request তৈরি হবে, TrxID পরে admin-কে পাঠাতে পারবেন।",
-        reply_markup=_subscription_ask_kb(code))
-    return SUBSCRIPTION_TRX
-
-
-async def subreq_trx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive the TrxID text and finish the request."""
-    pending=context.user_data.get("sub_pending") or {}
-    trx=parse_trx_id(update.effective_message.text or "")
-    if not trx:
-        await update.effective_message.reply_text(
-            "⚠️ TrxID-টা ঠিক মনে হচ্ছে না (৬–৬৪ অক্ষর, শুধু অক্ষর ও সংখ্যা)।\n"
-            "আবার পাঠান, অথবা নিচের বাটন দিয়ে TrxID ছাড়াই request করুন।",
-            reply_markup=_subscription_ask_kb(pending.get("code","pro30")))
-        return SUBSCRIPTION_TRX
-    await finish_subscription_request(update, context, trx)
-    return ConversationHandler.END
-
-
-async def subreq_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Finish the request without a TrxID (they can send it later)."""
-    q=update.callback_query; await q.answer()
-    await finish_subscription_request(update, context, None, message=q.message)
-    return ConversationHandler.END
-
-
-async def subreq_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q=update.callback_query; await q.answer()
-    context.user_data.pop("sub_pending",None)
-    await q.message.reply_text("বাতিল করা হয়েছে। আবার চাইলে /subscribe পাঠান।")
-    return ConversationHandler.END
-
-
-async def subscription_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("sub_pending",None)
-    await update.effective_message.reply_text("বাতিল করা হয়েছে। আবার চাইলে /subscribe পাঠান।")
-    return ConversationHandler.END
-
-
-async def finish_subscription_request(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                      trx: str | None, message: Any | None = None) -> None:
-    """Insert the pending request (now WITH transaction_id) and notify admins."""
-    assert BOT is not None
-    message=message or update.effective_message
-    pending=context.user_data.pop("sub_pending",None) or {}
-    code=pending.get("code","pro30"); days=30 if code=="pro30" else 90
-    if not BOT.db:
-        await message.reply_text("Subscription request-এর জন্য DATABASE_URL প্রয়োজন।"); return
-    existing=await BOT.db.fetchval("SELECT id FROM subscription_requests WHERE telegram_id=$1 AND status='pending'",update.effective_user.id)
-    if existing:
-        await message.reply_text(f"আপনার Request #{existing} ইতোমধ্যে pending আছে। Admin review-এর অপেক্ষা করুন।"); return
-    rid=await BOT.db.fetchval(
-        "INSERT INTO subscription_requests(telegram_id,plan_code,days,transaction_id) VALUES($1,$2,$3,$4) RETURNING id",
-        update.effective_user.id,code,days,trx)
-    price=PRO_30_PRICE if days==30 else PRO_90_PRICE
-    trx_line=f"TrxID: {html.escape(trx)}" if trx else "TrxID: এখনো দেওয়া হয়নি"
-    usdt_line=""
-    if usdt_wallet():
-        amount=usdt_quote_for_price(price,rid)
-        if amount:
-            try:
-                await BOT.db.execute("UPDATE subscription_requests SET usdt_amount=$2 WHERE id=$1",rid,amount)
-                usdt_line=(f"\n\n💵 USDT (TRC20) দিয়ে দিতে চাইলে ঠিক {amount:.3f} USDT পাঠান:\n"
-                           f"{usdt_wallet()}\n(auto-verify কয়েক মিনিটে, অথবা /paid <TXID>)")
-            except Exception: log.warning("Could not store USDT amount for request %s",rid)
-    await message.reply_text(
-        f"✅ Subscription request #{rid} গ্রহণ করা হয়েছে।\n\n"
-        f"Plan: Pro {days} দিন · মূল্য: {price}\n{trx_line}\n"
-        f"Admin review করলে আপনাকে notification দেওয়া হবে।{usdt_line}")
-    approve_cmd=f"/approve {update.effective_user.id} {days}"
-    admin_msg=(f"নতুন subscription request #{rid}\nUser: <code>{update.effective_user.id}</code> (@{html.escape(update.effective_user.username or 'none')})\n"
-               f"Plan: Pro {days} days · মূল্য: {html.escape(price)}\n<b>{trx_line}</b>\n"
-               f"Approve command:\n<code>{approve_cmd}</code>")
-    admin_kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{rid}")],[InlineKeyboardButton("📋 Copy TrxID",copy_text=CopyTextButton(trx or "no-trx")),InlineKeyboardButton("📋 Copy command",copy_text=CopyTextButton(approve_cmd))],[InlineKeyboardButton("👤 User details",callback_data=f"admuser|{update.effective_user.id}")]])
-    for admin_id in ADMIN_IDS:
-        try: await context.bot.send_message(admin_id,admin_msg,reply_markup=admin_kb,parse_mode=ParseMode.HTML)
-        except Exception: log.warning("Could not notify admin %s",admin_id)
-
-
 async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Usage: /risk ENTRY STOP CAPITAL RISK_PERCENT"""
     if len(context.args) != 4:
@@ -2728,40 +1698,6 @@ async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"Position-size calculator\n\nDirection: {direction}\nCapital: ${capital:.2f}\nRisk: {risk_pct:.2f}% = ${r['risk_cash']:.2f}\nEntry: {entry:.8g}\nStop: {stop:.8g}\nStop distance: {r['stop_distance_pct']:.2f}%\nUnits: {r['units']:.8g}\nPosition value: ${r['position_value']:.2f}\n\nFees, slippage ও leverage risk অন্তর্ভুক্ত নয়।")
     except ValueError:
         await update.effective_message.reply_text("সব মান positive number হতে হবে এবং entry ও stop আলাদা হতে হবে।")
-
-CALC_USAGE=("ব্যবহার: /calc ENTRY STOP CAPITAL RISK% LEVERAGE [TARGET]\n"
-            "উদাহরণ: /calc 70000 68000 1000 1 10 74000\n"
-            "Direction নিজে থেকে ঠিক হবে (STOP < ENTRY = long)।")
-
-
-async def calc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/calc — futures position size, margin, liquidation and R:R together."""
-    args=list(context.args or [])
-    if len(args) not in {5,6}:
-        await update.effective_message.reply_text(CALC_USAGE); return
-    try:
-        entry,stop,capital,risk_pct,leverage=map(float,args[:5])
-        target=float(args[5]) if len(args)==6 else None
-        r=futures_calc(entry,stop,capital,risk_pct,leverage,target)
-    except ValueError:
-        await update.effective_message.reply_text("সব মান positive number হতে হবে; ENTRY ও STOP আলাদা হতে হবে।\n\n"+CALC_USAGE); return
-    direction="Long" if r["direction"]=="long" else "Short"
-    reward_line=(f"Target: {target:.8g} · R:R = 1:{r['reward_r']:.2f}\n" if r["reward_r"] is not None else
-                 "Target দেওয়া হয়নি — R:R দেখতে শেষে target যোগ করুন।\n")
-    text=(f"🧮 Futures calculator — {direction}\n\n"
-          f"Entry: {entry:.8g} · Stop: {stop:.8g} (distance {r['stop_distance_pct']:.2f}%)\n"
-          f"Capital: ${capital:.2f} · Risk {risk_pct:.2f}% = ${r['risk_cash']:.2f}\n"
-          f"Leverage: {leverage:.0f}x → Position ${r['position_value']:.2f}\n"
-          f"Margin required: ${r['margin']:.2f}\n"
-          f"Size: {r['units']:.8g} units\n"
-          f"Estimated liquidation (isolated): {r['liquidation']:.8g}\n"
-          f"Round-trip fees (0.05%/side): ${r['fees_round_trip']:.2f} → total risk ${r['risk_including_fees']:.2f}\n"
-          f"{reward_line}")
-    if r["warnings"]:
-        text+="\n⚠️ "+"\n⚠️ ".join(r["warnings"])
-    text+="\n\nএটি হিসাব, আর্থিক পরামর্শ নয়।"
-    await update.effective_message.reply_text(text)
-
 
 async def save_breakout_events(symbol: str,timeframe: str,events: list[dict[str,Any]]) -> None:
     assert BOT is not None
@@ -2811,32 +1747,13 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if await BOT.effective_plan(update.effective_user.id) not in {"pro","admin"}:
         await update.effective_message.reply_text("Advanced backtest Pro feature। সুবিধা দেখতে /subscribe পাঠান।"); return
     if not context.args:
-        await update.effective_message.reply_text("ব্যবহার: /backtest BTC 4h [candles 200-5000]"); return
-    status=None
+        await update.effective_message.reply_text("ব্যবহার: /backtest BTC 4h"); return
     try:
         req=Request(BOT._normalize_symbol(context.args[0]),BOT._normalize_tf(context.args[1] if len(context.args)>1 else "4h"))
-        target=int(context.args[2]) if len(context.args)>2 and context.args[2].isdigit() else 1200
-        status=await update.effective_message.reply_text(f"⏳ {req.symbol} • {req.timeframe}: {target} candle এনে ব্যাকটেস্ট চলছে…")
-        frame=await BOT.fetch_history(req.symbol,req.timeframe,target=target)
-        r=simple_backtest(frame)
-        ins,out=r["in_sample"],r["out_sample"]
-        text=(f"🧪 {req.symbol} • {req.timeframe} — {r['candles']} closed candles\n\n"
-              f"Overall: {r['trades']} trades · {r['wins']}W/{r['losses']}L · win rate {r['win_rate']:.1f}%\n"
-              f"Net: {r['net_r_multiple']:+.2f}R (avg {r['avg_r']:+.2f}R per trade)\n"
-              f"Gross before costs: {r['gross_r_multiple']:+.2f}R → costs {r['gross_r_multiple']-r['net_r_multiple']:.2f}R\n\n"
-              f"In-sample (পুরনো): {ins['trades']} trades · {ins['win_rate']:.1f}% · {ins['net_r_multiple']:+.2f}R\n"
-              f"Out-of-sample (নতুন): {out['trades']} trades · {out['win_rate']:.1f}% · {out['net_r_multiple']:+.2f}R\n\n"
-              f"{r['assumptions']}\n\nএটি ঐতিহাসিক গবেষণা, লাভের নিশ্চয়তা নয়।")
-        if status:
-            await status.edit_text(text); status=None
-        else:
-            await update.effective_message.reply_text(text)
-    except UserInputError as exc:
-        await update.effective_message.reply_text(f"⚠️ {exc}")
-    finally:
-        if status:
-            try: await status.delete()
-            except BadRequest: pass
+        frame=await BOT.fetch_candles(req); r=simple_backtest(frame)
+        await update.effective_message.reply_text(
+            f"🧪 {req.symbol} • {req.timeframe}\nClosed trades: {r['trades']}\nWins/Losses: {r['wins']}/{r['losses']}\nWin rate: {r['win_rate']:.1f}%\nNet: {r['net_r_multiple']:.1f}R\n\n{r['assumptions']}\nএটি সীমিত candle sample-এর গবেষণা, লাভের নিশ্চয়তা নয়।")
+    except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}")
 
 async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
@@ -2932,7 +1849,6 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}")
 
 FUT_SYMBOL,FUT_ENTRY,FUT_STOP,FUT_TP1,FUT_TP2,FUT_TP3=range(60,66)
-SUBSCRIPTION_TRX=range(90,91)[0]   # waits for the bKash/Nagad TrxID
 
 async def futures_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
@@ -3210,12 +2126,11 @@ async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     tf=BOT._normalize_tf(context.args[0] if context.args else "4h")
     status=await update.effective_message.reply_text("Top-volume 60টি market scan চলছে…")
     try:
-        markets=await BOT._ensure_markets()
-        venue=BOT.markets_exchange or BOT.exchange
-        tickers=await venue.fetch_tickers(); candidates=[]
+        if not BOT.markets_loaded: await BOT.exchange.load_markets(); BOT.markets_loaded=True
+        tickers=await BOT.exchange.fetch_tickers(); candidates=[]
         excluded={"USDC/USDT","FDUSD/USDT","TUSD/USDT","USDP/USDT","DAI/USDT"}
         for symbol,t in tickers.items():
-            m=markets.get(symbol,{})
+            m=BOT.exchange.markets.get(symbol,{})
             if symbol.endswith("/USDT") and m.get("spot") and m.get("active",True) and symbol not in excluded:
                 candidates.append((float(t.get("quoteVolume") or 0),symbol))
         # Scan enough liquid pairs to retain 60 even if a few endpoints fail.
@@ -3241,345 +2156,6 @@ async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except BadRequest: pass
         raise
 
-LEVEL_USAGE=("ব্যবহার:\n"
-             "/level BTC 70000 — এই দামে পৌঁছালে জানাবে\n"
-             "/level list — সব active level\n"
-             "/level del 12 — একটা level মুছে ফেলবে")
-
-
-async def level_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/level — plain price-level alerts ("BTC 70000 ছুঁলে জানাও")."""
-    assert BOT is not None
-    args=list(context.args or [])
-    if not BOT.db:
-        await update.effective_message.reply_text("Price-level alert-এর জন্য DATABASE_URL প্রয়োজন।"); return
-    await BOT.ensure_user(update)
-    user_id=update.effective_user.id
-    if not args:
-        await update.effective_message.reply_text(LEVEL_USAGE); return
-    if args[0].lower() in {"list","show"}:
-        rows=await BOT.db.fetch("SELECT id,symbol,level,direction,active,repeat FROM price_levels WHERE telegram_id=$1 AND active ORDER BY id",user_id)
-        if not rows:
-            await update.effective_message.reply_text("কোনো active price level নেই। উদাহরণ: /level BTC 70000"); return
-        lines=["🎯 আপনার price levels:"]
-        for row in rows:
-            lines.append(f"#{row['id']} · {row['symbol']} {'≥' if row['direction']=='above' else '≤'} "
-                         f"{float(row['level']):.8g}" + (" · repeat" if row['repeat'] else ""))
-        lines.append("\nমুছতে: /level del <id>")
-        await update.effective_message.reply_text("\n".join(lines)); return
-    if args[0].lower() in {"del","delete","remove"} and len(args)>=2 and args[1].isdigit():
-        await BOT.db.execute("DELETE FROM price_levels WHERE id=$1 AND telegram_id=$2",int(args[1]),user_id)
-        await update.effective_message.reply_text(f"🗑 Level #{args[1]} মুছে ফেলা হয়েছে।"); return
-    # /level BTC 70000  (order-independent: the numeric token is the level)
-    numbers=[token for token in args if token.replace('.','',1).isdigit()]
-    names=[token for token in args if token not in numbers]
-    repeat="repeat" in (token.lower() for token in args)
-    names=[token for token in names if token.lower()!="repeat"]
-    if not numbers or not names:
-        await update.effective_message.reply_text(LEVEL_USAGE); return
-    try:
-        symbol=BOT._normalize_symbol(names[0]); level=float(numbers[0])
-    except (UserInputError,ValueError):
-        await update.effective_message.reply_text("Symbol বা দাম ঠিক নয়। উদাহরণ: /level BTC 70000"); return
-    live=await BOT.fetch_live_price(symbol); price=float(live.get("price") or 0)
-    if price<=0:
-        await update.effective_message.reply_text(f"{symbol}-এর বর্তমান দাম পাওয়া যাচ্ছে না — পরে আবার চেষ্টা করুন।"); return
-    # direction follows the live price: a level above price fires on the way up,
-    # a level below price fires if price falls back to it.
-    direction=price_level_direction(level,price)
-    chat_id=update.effective_chat.id
-    try:
-        row_id=await BOT.db.fetchval("""INSERT INTO price_levels(telegram_id,chat_id,symbol,level,direction,repeat)
-                                       VALUES($1,$2,$3,$4,$5,$6)
-                                       ON CONFLICT(telegram_id,symbol,level)
-                                       DO UPDATE SET active=TRUE,direction=EXCLUDED.direction,repeat=EXCLUDED.repeat
-                                       RETURNING id""",user_id,chat_id,symbol,level,direction,repeat)
-    except Exception:
-        log.exception("Price level insert failed")
-        await update.effective_message.reply_text("Level সংরক্ষণ করা যায়নি।"); return
-    await update.effective_message.reply_text(
-        f"🎯 Level #{row_id} সংরক্ষিত\n{symbol} {'≥' if direction=='above' else '≤'} {level:.8g}\n"
-        f"বর্তমান দাম: {price:.8g} · {'উপরে গেলে' if direction=='above' else 'নিচে নামলে'} জানানো হবে"
-        + (" · বারবার" if repeat else ""))
-
-
-async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/portfolio — holdings, live value and unrealised PnL."""
-    assert BOT is not None
-    if not BOT.db:
-        await update.effective_message.reply_text("Portfolio-এর জন্য DATABASE_URL প্রয়োজন।"); return
-    await BOT.ensure_user(update)
-    user_id=update.effective_user.id; args=list(context.args or [])
-    if args and args[0].lower() in {"add","set"} and len(args)>=4:
-        try:
-            symbol=BOT._normalize_symbol(args[1]); amount=float(args[2]); cost=float(args[3])
-            if amount<=0 or cost<=0: raise ValueError
-        except (UserInputError,ValueError):
-            await update.effective_message.reply_text("ব্যবহার: /portfolio add BTC 0.5 65000"); return
-        await BOT.db.execute("""INSERT INTO portfolio(telegram_id,symbol,amount,avg_cost) VALUES($1,$2,$3,$4)
-                                ON CONFLICT(telegram_id,symbol)
-                                DO UPDATE SET amount=EXCLUDED.amount,avg_cost=EXCLUDED.avg_cost,updated_at=NOW()""",
-                             user_id,symbol,amount,cost)
-        await update.effective_message.reply_text(f"✅ {symbol}: {amount:g} @ {cost:.8g} সেভ হয়েছে।")
-        return
-    if args and args[0].lower() in {"del","delete","remove"} and len(args)>=2:
-        symbol=BOT._normalize_symbol(args[1])
-        await BOT.db.execute("DELETE FROM portfolio WHERE telegram_id=$1 AND symbol=$2",user_id,symbol)
-        await update.effective_message.reply_text(f"🗑 {symbol} portfolio থেকে বাদ দেওয়া হয়েছে।"); return
-    rows=await BOT.db.fetch("SELECT symbol,amount,avg_cost FROM portfolio WHERE telegram_id=$1 ORDER BY symbol",user_id)
-    if not rows:
-        await update.effective_message.reply_text(
-            "Portfolio খালি।\nযোগ করতে: /portfolio add BTC 0.5 65000\nদেখতে: /portfolio"); return
-    prices={}
-    for row in rows:
-        live=await BOT.fetch_live_price(row["symbol"])
-        prices[row["symbol"]]=float(live.get("price") or 0)
-    stats=portfolio_pnl([dict(row) for row in rows],prices)
-    lines=["💼 আপনার portfolio"]
-    for item in stats["rows"]:
-        arrow="🟢" if item["pnl"]>=0 else "🔴"
-        lines.append(f"{arrow} {item['symbol']}: {item['amount']:g} @ {item['avg_cost']:.8g}\n"
-                     f"   এখন {item['price']:.8g} → ${item['value']:,.2f} ({item['pnl']:+,.2f} / {item['pnl_pct']:+.2f}%)")
-    lines.append(f"\nমোট মূল্য: ${stats['total_value']:,.2f} · খরচ: ${stats['total_cost']:,.2f}")
-    lines.append(f"Unrealised PnL: ${stats['total_pnl']:+,.2f} ({stats['total_pnl_pct']:+.2f}%)")
-    if stats["missing"]:
-        lines.append("⚠️ দাম পাওয়া যায়নি: "+", ".join(stats["missing"]))
-    lines.append("\nএটি হিসাব, আর্থিক পরামর্শ নয়।")
-    await update.effective_message.reply_text("\n".join(lines))
-
-
-MTF_USAGE="ব্যবহার: /mtf BTC — 15m/1h/4h/1d confluence একসাথে দেখুন"
-
-
-PAID_USAGE=("USDT (TRC20) পেমেন্ট\n"
-            "/paid — কী ঠিকানা ও কত পাঠাতে হবে দেখুন\n"
-            "/paid <TXID> — TXID দিলে সাথে সাথে যাচাই হবে")
-
-
-def usdt_quote_for_price(price_text: Any, seed: int) -> float | None:
-    """Unique USDT amount for a package price, or None when not verifiable."""
-    base=parse_usdt_price(price_text)
-    return unique_usdt_amount(base,seed) if base else None
-
-
-async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/paid — show the USDT address + exact amount, or verify a TXID on demand."""
-    assert BOT is not None
-    if not BOT.db:
-        await update.effective_message.reply_text("USDT verify-এর জন্য DATABASE_URL প্রয়োজন।"); return
-    await BOT.ensure_user(update)
-    wallet=usdt_wallet()
-    if not wallet:
-        await update.effective_message.reply_text(
-            "⚠️ USDT auto-verify এই মুহূর্তে বন্ধ (wallet address সেট করা নেই)।\n"
-            "bKash/Nagad-এর মতো TrxID দিয়ে manual approval চলবে — /subscribe পাঠান।"); return
-    user_id=update.effective_user.id
-    row=await BOT.db.fetchrow("SELECT id,days,plan_code,usdt_amount FROM subscription_requests "
-                              "WHERE telegram_id=$1 AND status='pending' ORDER BY id DESC LIMIT 1",user_id)
-    if not row:
-        await update.effective_message.reply_text(
-            "আগে package বেছে নিন: /subscribe → Request Approval।\nএরপর /paid দিলে ঠিকানা ও ঠিক কত USDT পাঠাতে হবে দেখাবে।"); return
-    days=int(row["days"])
-    expected=row["usdt_amount"]
-    if expected is None:
-        expected=usdt_quote_for_price(PRO_30_PRICE if days==30 else PRO_90_PRICE,row["id"])
-        if expected is None:
-            await update.effective_message.reply_text(
-                "এই package-এর মূল্য USDT-তে নির্ধারিত নয় (PRO_30_PRICE/PRO_90_PRICE-এ USDT সংখ্যা নেই)।\n"
-                "তাই on-chain auto-verify সম্ভব নয় — bKash/Nagad TrxID দিয়ে manual approval হবে।"); return
-        await BOT.db.execute("UPDATE subscription_requests SET usdt_amount=$2 WHERE id=$1",row["id"],expected)
-    expected=float(expected)
-
-    if context.args:
-        txid=str(context.args[0]).strip()
-        status=await update.effective_message.reply_text("🔎 TXID যাচাই হচ্ছে…")
-        transfers=await BOT.usdt_transfers(limit=100)
-        found=next((item for item in transfers if item["txid"].lower()==txid.lower()),None)
-        if not found:
-            await status.edit_text(
-                f"⚠️ TXID {txid[:12]}… সাম্প্রতিক ১০০টি incoming transfer-এ পাওয়া যায়নি।\n"
-                "কয়েক মিনিট পর আবার চেষ্টা করুন (confirm হওয়ার সময় লাগে)।"); return
-        if not usdt_amount_matches(found["amount"],expected):
-            await status.edit_text(
-                f"⚠️ TXID পাওয়া গেছে কিন্তু পরিমাণ মিলছে না।\nপাঠানো: {found['amount']:.3f} USDT\n"
-                f"প্রয়োজন: {expected:.3f} USDT\n\nসাহায্য দরকার হলে admin-এর সঙ্গে যোগাযোগ করুন।"); return
-        already=await BOT.db.fetchval("SELECT 1 FROM usdt_payments WHERE txid=$1",found["txid"])
-        if already:
-            await status.edit_text("এই TXID আগেই ব্যবহার হয়ে গেছে।"); return
-        await BOT.db.execute("INSERT INTO usdt_payments(txid,telegram_id,request_id,amount,days) "
-                             "VALUES($1,$2,$3,$4,$5) ON CONFLICT(txid) DO NOTHING",
-                             found["txid"],user_id,row["id"],found["amount"],days)
-        await apply_approval(context,user_id,days,source="usdt_txid",txid=found["txid"])
-        await status.edit_text(f"✅ পেমেন্ট যাচাই হয়েছে ({found['amount']:.3f} USDT)।\nPro {days} দিন চালু হয়েছে।")
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(admin_id,
-                    f"💵 USDT auto-verified\nUser: {user_id}\nAmount: {found['amount']:.3f} USDT\n"
-                    f"TXID: {found['txid']}\nDays: {days}")
-            except Exception: log.warning("USDT notify to admin %s failed",admin_id)
-        return
-
-    await update.effective_message.reply_text(
-        f"💵 USDT (TRC20) পেমেন্ট\n\n"
-        f"এই ঠিকানায় পাঠান:\n{wallet}\n\n"
-        f"ঠিক {expected:.3f} USDT পাঠাতে হবে (এই ভগ্নাংশটুকুই আপনার পেমেন্ট চেনার চিহ্ন — কম/বেশি হলে mismatch হবে)।\n"
-        f"Package: Pro {days} দিন · Request #{row['id']}\n\n"
-        "পাঠানোর পর কয়েক মিনিটের মধ্যে বট নিজেই যাচাই করে approve করবে।\n"
-        "সাথে সাথেই যাচাই করতে চাইলে: /paid <TXID>\n\n"
-        "শুধু TRC20 (Tron) নেটওয়ার্কে পাঠাবেন — অন্য নেটওয়ার্কের USDT হারিয়ে যাবে।")
-
-
-async def usdt_verify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Poll incoming USDT transfers and auto-approve matching pending requests."""
-    assert BOT is not None
-    if not BOT.db or not usdt_wallet(): return
-    try:
-        rows=await BOT.db.fetch("SELECT id,telegram_id,days,usdt_amount FROM subscription_requests "
-                                "WHERE status='pending' AND usdt_amount IS NOT NULL "
-                                "AND created_at>NOW()-INTERVAL '48 hours' ORDER BY id DESC LIMIT 50")
-    except Exception:
-        log.exception("USDT verify query failed"); return
-    if not rows: return
-    transfers=await BOT.usdt_transfers(limit=100)
-    if not transfers: return
-    for row in rows:
-        match=match_usdt_transfer(transfers,float(row["usdt_amount"]),0)
-        if not match: continue
-        try:
-            if await BOT.db.fetchval("SELECT 1 FROM usdt_payments WHERE txid=$1",match["txid"]): continue
-            await BOT.db.execute("INSERT INTO usdt_payments(txid,telegram_id,request_id,amount,days) "
-                                 "VALUES($1,$2,$3,$4,$5) ON CONFLICT(txid) DO NOTHING",
-                                 match["txid"],row["telegram_id"],row["id"],match["amount"],row["days"])
-            await apply_approval(context,row["telegram_id"],int(row["days"]),source="usdt_auto",
-                                 txid=match["txid"])
-            log.info("USDT auto-approved user=%s amount=%.3f",row["telegram_id"],match["amount"])
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(admin_id,
-                        f"💵 USDT auto-verified (auto)\nUser: {row['telegram_id']}\n"
-                        f"Amount: {match['amount']:.3f} USDT\nTXID: {match['txid']}\nDays: {row['days']}")
-                except Exception: log.warning("USDT notify to admin %s failed",admin_id)
-        except Exception:
-            log.exception("USDT auto-approve failed for request %s",row["id"])
-
-
-async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/invite — personal referral link plus this user's own numbers."""
-    assert BOT is not None
-    username=getattr(context.bot,"username",None)
-    if not username:
-        await update.effective_message.reply_text("Bot username পাওয়া যায়নি, একটু পরে চেষ্টা করুন।"); return
-    user_id=update.effective_user.id
-    link=f"https://t.me/{username}?start=ref_{user_id}"
-    invited=rewarded=0
-    if BOT.db:
-        rows=await BOT.db.fetch("SELECT referrer_id,rewarded_at FROM referrals WHERE referrer_id=$1",user_id)
-        for row in referral_summary([dict(item) for item in rows]):
-            invited, rewarded = row["invited"], row["rewarded"]
-    await update.effective_message.reply_text(
-        f"🎁 আপনার invite link:\n{link}\n\n"
-        f"কেউ এই link দিয়ে শুরু করলে আপনার হিসেবে যোগ হবে।\n"
-        f"আপনার invite: {invited} · paid হয়ে reward পেয়েছেন: {rewarded}\n\n"
-        f"বন্ধু approve/pay করলে আপনি {REFERRAL_REWARD_DAYS} দিন Pro পাবেন।")
-
-
-async def trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/trial — start the one-time free trial, if it is still unused."""
-    del context; assert BOT is not None
-    if not BOT.db:
-        await update.effective_message.reply_text("Trial-এর জন্য DATABASE_URL প্রয়োজন।"); return
-    await BOT.ensure_user(update)
-    if await BOT.grant_trial(update.effective_user.id):
-        await update.effective_message.reply_text(
-            f"🎁 আপনার {TRIAL_DAYS} দিনের free trial চালু হয়েছে।\n"
-            "সব Pro command এখন খোলা — /help দেখুন।"); return
-    plan=await BOT.effective_plan(update.effective_user.id)
-    if plan in {"pro","admin"}:
-        await update.effective_message.reply_text("আপনার Pro access এখনই সক্রিয়, trial লাগবে না।"); return
-    await update.effective_message.reply_text(
-        "এই account-এ trial একবারই পাওয়া যায় এবং সেটি ব্যবহার হয়ে গেছে।\n"
-        "Package দেখতে /subscribe পাঠান।")
-
-
-async def referrals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/referrals — admin leaderboard of invite performance."""
-    assert BOT is not None
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.effective_message.reply_text("অনুমতি নেই।"); return
-    if not BOT.db:
-        await update.effective_message.reply_text("DATABASE_URL প্রয়োজন।"); return
-    rows=await BOT.db.fetch("SELECT referrer_id,rewarded_at FROM referrals ORDER BY created_at DESC LIMIT 2000")
-    board=referral_summary([dict(row) for row in rows])
-    if not board:
-        await update.effective_message.reply_text("এখনো কোনো referral নেই।"); return
-    lines=["👥 Referral report", f"মোট invite: {len(rows)} · paid: {sum(r['rewarded'] for r in board)}", ""]
-    for item in board[:20]:
-        lines.append(f"• {item['referrer_id']}: {item['invited']} invite · {item['rewarded']} paid")
-    lines.append(f"\nপ্রতি paid referral-এ রেফারার {REFERRAL_REWARD_DAYS} দিন Pro পান।")
-    await update.effective_message.reply_text("\n".join(lines))
-
-
-async def mtf_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/mtf — 15m/1h/4h/1d confluence for one pair (Pro)."""
-    assert BOT is not None
-    if not context.args:
-        await update.effective_message.reply_text(MTF_USAGE); return
-    if await BOT.effective_plan(update.effective_user.id) not in {"pro","admin"}:
-        await update.effective_message.reply_text("MTF confluence Pro feature। সুবিধা দেখতে /subscribe পাঠান।"); return
-    try:
-        symbol=BOT._normalize_symbol(context.args[0])
-    except UserInputError as exc:
-        await update.effective_message.reply_text(f"⚠️ {exc}"); return
-    status=await update.effective_message.reply_text(f"⏳ {symbol}: 15m/1h/4h/1d দেখা হচ্ছে…")
-    try:
-        result=await BOT.multi_timeframe(Request(symbol,"4h"))
-    except UserInputError as exc:
-        await status.edit_text(f"⚠️ {exc}"); return
-    if result.get("status")=="unavailable":
-        await status.edit_text("টাইমফ্রেম ডেটা পাওয়া যায়নি। কিছুক্ষণ পরে চেষ্টা করুন।"); return
-    lines=[f"🧭 {symbol} — multi-timeframe confluence",
-           f"Bias: {result['bias']} · score {result['score']}/100 · "
-           f"{result['aligned_count']}/{len(MTF_TIMEFRAMES)} টাইমফ্রেম একমত"]
-    for tf in MTF_TIMEFRAMES:
-        item=result["timeframes"].get(tf,{})
-        if item.get("status")=="unavailable":
-            lines.append(f"• {tf}: ডেটা নেই"); continue
-        arrow={"bullish":"🟢 bullish","bearish":"🔴 bearish"}.get(item.get("lean"),"⚪ neutral")
-        lines.append(f"• {tf}: {arrow} · {item.get('structure')} · RSI {item.get('rsi')} · "
-                     f"EMA50 {'উপরে' if item.get('above_ema50') else 'নিচে'}")
-    lines.append(f"\n{result.get('reading','')}")
-    lines.append("Score = টাইমফ্রেম ওজন অনুযায়ী ঐকমত্য, সম্ভাবনা নয়।")
-    await status.edit_text("\n".join(lines))
-
-
-async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Signal scorecard: how often this bot's own breakout signals followed through."""
-    assert BOT is not None
-    if await BOT.effective_plan(update.effective_user.id) not in {"pro","admin"}:
-        await update.effective_message.reply_text("Signal scorecard Pro feature। সুবিধা দেখতে /subscribe পাঠান।"); return
-    if not BOT.db:
-        await update.effective_message.reply_text("Scorecard-এর জন্য DATABASE_URL প্রয়োজন।"); return
-    days=int(context.args[0]) if context.args and context.args[0].isdigit() else 30
-    rows=await BOT.db.fetch("""SELECT event_type,timeframe,max_follow_through_pct
-                                FROM breakout_events WHERE candle_close>NOW()-($1||' days')::interval
-                                ORDER BY candle_close DESC LIMIT 1000""",str(days))
-    if not rows:
-        await update.effective_message.reply_text(f"গত {days} দিনে কোনো সংরক্ষিত signal নেই।"); return
-    stats=scorecard_stats([dict(row) for row in rows])
-    lines=[f"📊 Signal scorecard — শেষ {days} দিন",
-           f"মোট signal: {stats['total']} · মূল্যায়িত: {stats['evaluated']} · অপেক্ষমাণ: {stats['pending']}",
-           f"{SCORECARD_MIN_MOVE_PCT}%+ follow-through: {stats['hits']} ({stats['hit_rate']}%)",
-           f"গড় সর্বোচ্চ মুভ: {stats['avg_move']}% · সর্বোচ্চ {stats['best']}% · সর্বনিম্ন {stats['worst']}%"]
-    if stats["by_type"]:
-        lines.append("\nধরন অনুযায়ী:" + "".join(
-            f"\n• {name}: {v['hit']}/{v['total']} ({v['rate']}%)" for name,v in stats["by_type"].items()))
-    if stats["by_timeframe"]:
-        lines.append("\nটাইমফ্রেম অনুযায়ী:" + "".join(
-            f"\n• {tf}: {v['hit']}/{v['total']} ({v['rate']}%)" for tf,v in stats["by_timeframe"].items()))
-    lines.append("\nএটি বটের নিজের সংকেতের ফলো-থ্রু পরিসংখ্যান; ভবিষ্যতের নিশ্চয়তা নয়।")
-    await update.effective_message.reply_text("\n".join(lines))
-
-
 async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if not context.args: await update.effective_message.reply_text("ব্যবহার: /timezone Asia/Dhaka"); return
@@ -3598,9 +2174,7 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if BOT.db:
         try: await BOT.db.fetchval("SELECT 1"); db="ok"
         except Exception: db="error"
-    try:
-        await (BOT.markets_exchange or BOT.exchange).fetch_time()
-        exchange=f"ok ({BOT.markets_source or 'Binance'})"
+    try: await BOT.exchange.fetch_time(); exchange="ok"
     except Exception: exchange="error"
     scan=BOT.last_alert_scan.isoformat(timespec="seconds") if BOT.last_alert_scan else "not yet"
     await update.effective_message.reply_text(f"Health\n\nBot: ok\nDatabase: {db}\nExchange: {exchange}\nGemini model: {MODEL_NAME}\nLast alert scan: {scan}\nCache entries: {len(BOT.cache._data)}")
@@ -3629,36 +2203,6 @@ async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     users,alerts,analyses=await asyncio.gather(BOT.db.fetchval("SELECT count(*) FROM users"),BOT.db.fetchval("SELECT count(*) FROM alerts WHERE active"),BOT.db.fetchval("SELECT count(*) FROM analyses"))
     await update.effective_message.reply_text(f"Users: {users}\nActive alerts: {alerts}\nSaved analyses: {analyses}")
 
-async def apply_approval(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: int,
-                         source: str = "manual", admin_id: int = 0,
-                         txid: str | None = None) -> int | None:
-    """One approval path for /approve and for verified USDT payments.
-
-    Returns the referrer id when a referral reward was paid out, else None.
-    """
-    assert BOT is not None and BOT.db is not None
-    await BOT.db.execute("INSERT INTO users(telegram_id,plan,plan_until) VALUES($1,'pro',NOW()+$2*INTERVAL '1 day') ON CONFLICT(telegram_id) DO UPDATE SET plan='pro',plan_until=GREATEST(COALESCE(users.plan_until,NOW()),NOW())+$2*INTERVAL '1 day',blocked=FALSE,expiry_3d_sent=FALSE,expiry_1d_sent=FALSE",user_id,days)
-    await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,$2,$3,$4::jsonb)",
-                         int(admin_id or 0),f"approve_{source}",user_id,
-                         json.dumps({"days":days,"source":source,"txid":txid}))
-    await BOT.db.execute("UPDATE subscription_requests SET status='approved',reviewed_at=NOW(),"
-                         "transaction_id=COALESCE($2,transaction_id) WHERE telegram_id=$1 AND status='pending'",
-                         user_id,txid)
-    await set_user_menu(context.bot,user_id,"pro")
-    try:
-        await context.bot.send_message(user_id,
-            f"🎉 আপনার Pro subscription অনুমোদিত হয়েছে।\nমেয়াদ: {days} দিন\n\n{plan_text('pro')}\n\n"
-            "সব Pro command জানতে /help পাঠান।")
-    except Exception: log.warning("Could not notify approved user %s",user_id)
-    referrer=await BOT.reward_referrer(user_id)
-    if referrer:
-        try:
-            await context.bot.send_message(referrer,
-                f"🎁 আপনার invite করা user পেমেন্ট করেছেন।\nআপনি {REFERRAL_REWARD_DAYS} দিন Pro পেয়েছেন।")
-        except Exception: log.warning("Referral reward notice to %s failed",referrer)
-    return referrer
-
-
 async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if update.effective_user.id not in ADMIN_IDS:
@@ -3666,11 +2210,14 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not BOT.db or len(context.args)<2 or not context.args[0].isdigit() or not context.args[1].isdigit():
         await update.effective_message.reply_text("ব্যবহার: /approve USER_ID DAYS"); return
     uid,days=int(context.args[0]),min(3650,int(context.args[1]))
-    referrer=await apply_approval(context,uid,days,source="command",admin_id=update.effective_user.id)
+    await BOT.db.execute("INSERT INTO users(telegram_id,plan,plan_until) VALUES($1,'pro',NOW()+$2*INTERVAL '1 day') ON CONFLICT(telegram_id) DO UPDATE SET plan='pro',plan_until=GREATEST(COALESCE(users.plan_until,NOW()),NOW())+$2*INTERVAL '1 day',blocked=FALSE,expiry_3d_sent=FALSE,expiry_1d_sent=FALSE",uid,days)
+    await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'approve_command',$2,$3::jsonb)",update.effective_user.id,uid,json.dumps({"days":days}))
+    await BOT.db.execute("UPDATE subscription_requests SET status='approved',reviewed_at=NOW() WHERE telegram_id=$1 AND status='pending'",uid)
+    await set_user_menu(context.bot,uid,"pro")
     await update.effective_message.reply_text(f"✅ User {uid}: Pro for {days} days")
-    if referrer:
-        await update.effective_message.reply_text(
-            f"🎁 {uid}-কে {referrer} invite করেছিলেন — রেফারার {REFERRAL_REWARD_DAYS} দিন Pro পেলেন।")
+    try:
+        await context.bot.send_message(uid,f"🎉 আপনার Pro subscription অনুমোদিত হয়েছে।\nমেয়াদ: {days} দিন\n\n{plan_text('pro')}\n\nসব Pro command জানতে /help পাঠান।")
+    except Exception: log.warning("Could not notify approved user %s",uid)
 
 async def fetch_coin_logo(symbol: str) -> bytes | None:
     """Best-effort CoinGecko logo lookup, cached for 24 hours."""
@@ -3700,10 +2247,8 @@ async def channel_price_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     rows=await BOT.db.fetch("SELECT * FROM channel_price_alerts WHERE enabled AND (last_sent_at IS NULL OR last_sent_at<=NOW()-(interval_minutes*INTERVAL '1 minute')) ORDER BY id LIMIT 10")
     for row in rows:
         try:
-            symbol=row['symbol']; ticker=await BOT.fetch_live_price(symbol); price=float(ticker.get('price') or 0)
-            if price<=0: raise UserInputError("price unavailable")
-            change=float(ticker.get('percentage') or 0)
-            candles=await BOT._fetch_ohlcv_with_fallback(symbol,"15m",10,(symbol,"15m"))
+            symbol=row['symbol']; ticker=await BOT.exchange.fetch_ticker(symbol); price=float(ticker.get('last') or ticker.get('close'))
+            change=float(ticker.get('percentage') or 0); candles=await BOT.exchange.fetch_ohlcv(symbol,"15m",limit=10)
             base=symbol.split('/')[0]; common={"BTC":"Bitcoin","ETH":"Ethereum","BNB":"BNB","SOL":"Solana","DOGE":"Dogecoin","XRP":"XRP","ADA":"Cardano","SUI":"Sui","TRX":"TRON"}; name=common.get(base,base)
             logo=await fetch_coin_logo(symbol)
             card=make_price_card(symbol,name,price,change,candles,logo_bytes=logo)
@@ -3716,190 +2261,43 @@ async def channel_price_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as exc: log.exception("Channel price card failed for %s: %s",row['symbol'],exc)
 
 
-# ---------------------------------------------------------------------------
-# Breakout alert engine
-# ---------------------------------------------------------------------------
-def alert_candle_offsets(interval_seconds: int, timeframe: str, max_candles: int = 12) -> list[int]:
-    """Closed-candle offsets one alert cycle must evaluate (0 = newest closed).
-
-    ALERT_INTERVAL_SECONDS can be longer than the timeframe, so a cycle may skip
-    whole candles (a 1m chart checked every 3 minutes skips two). Those candles
-    are re-evaluated oldest first, otherwise a confirmed or false breakout could
-    disappear between two cycles and never be reported.
-    """
-    try:
-        tf_seconds = int(timeframe_delta(timeframe).total_seconds())
-    except Exception:
-        return [0]
-    if tf_seconds <= 0:
-        return [0]
-    needed = max(1, (max(int(interval_seconds), 1) + tf_seconds - 1) // tf_seconds)
-    return list(range(min(needed, max_candles)))
-
-
-def alert_event_decision(q: dict[str,Any], live_price: float, retest: dict[str,Any] | None = None) -> dict[str,Any]:
-    """Pure decision step (no I/O) so the alert rules stay unit-testable.
-
-    Confirmed states come from the closed candle only. Anything else may be
-    upgraded to "approaching" from the live ticker, which never confirms a
-    signal on its own.
-    """
-    bo=q["breakout"]; state=bo["state"]
-    if "CONFIRMED" not in state and live_price and live_price>0:
-        up_distance=(float(bo["bullish_trigger"])-live_price)/live_price*100
-        down_distance=(live_price-float(bo["bearish_trigger"]))/live_price*100
-        if up_distance<=1.0 and up_distance<=down_distance: state="APPROACHING_BREAKOUT"
-        elif down_distance<=1.0: state="APPROACHING_BREAKDOWN"
-    retest_name=(retest or {}).get("state")
-    event_state=retest_name if retest_name not in {None,"NOT_APPLICABLE","NO_RETEST_DATA","WAITING_FOR_RETEST"} else state
-    category=("retest" if "RETEST" in event_state
-              else "confirmed" if "CONFIRMED" in event_state
-              else "false" if "FALSE" in event_state
-              else "approaching" if "APPROACHING" in event_state
-              else "volume" if float(bo.get("volume_ratio") or 0)>=2 else None)
-    strong=("CONFIRMED" in event_state and float(bo["volume_ratio"])>=1.5 and float(bo["body_strength"])>=.60)
-    level=float((retest or {}).get("level") or bo["bullish_trigger"])
-    return {"state":state,"event_state":event_state,"category":category,"strong":strong,"level":level}
-
-
-def alert_is_wanted(category: str | None, strong: bool, event_filter: str) -> bool:
-    """Does this event match the monitor's filter (all / strict / category)."""
-    event_filter=event_filter or "all"
-    return ((category is not None and event_filter=="all")
-            or event_filter==category
-            or (event_filter=="strict" and strong))
-
-
-async def _evaluate_alert_group(symbol: str, timeframe: str, row_count: int) -> list[dict[str,Any]]:
-    """Evaluate ONE (symbol,timeframe) once for every watcher of that pair.
-
-    One candle fetch + one ticker call per cycle, however many users watch the
-    pair; the resulting quant is reused by every alert row in the group.
-    """
-    assert BOT is not None
-    key=(symbol,timeframe); now=time.time(); entry=BOT.alert_cache.get(key)
-    if entry and now<entry["recheck_at"]:
-        # The newest closed candle cannot have changed yet: reuse it instead of
-        # hammering the exchange on every cycle.
-        frame=entry["frame"]
-    else:
-        frame=await BOT.fetch_candles(Request(symbol,timeframe),force=True)
-        try: tf_seconds=float(timeframe_delta(timeframe).total_seconds())
-        except Exception: tf_seconds=60.0
-        last_open=frame.index[-1].to_pydatetime()
-        BOT.alert_cache[key]={"frame":frame,
-                              "recheck_at":(last_open+timedelta(seconds=tf_seconds)).timestamp()+5.0}
-    live=await BOT.fetch_live_price(symbol)
-    live_price=float(live.get("price") or 0)
-    evaluations: list[dict[str,Any]] = []
-    for offset in reversed(alert_candle_offsets(ALERT_INTERVAL,timeframe)):
-        view=frame if offset==0 else frame.iloc[:-offset]
-        if len(view)<100: continue
-        payload=BOT.alert_snapshot(symbol,timeframe,view)
-        q=payload["quant"]
-        # Live ticker and retest only describe the newest closed candle; older
-        # (catch-up) candles are judged on their own close.
-        retest=retest_state(payload["frame"],q["breakout"]) if offset==0 else None
-        decision=alert_event_decision(q, live_price if offset==0 else float(q["last"]), retest)
-        candle=view.index[-1].isoformat()
-        evaluations.append({**decision,"candle":candle,"q":q,
-                            "live_price":live_price if offset==0 else None,
-                            "fingerprint":event_fingerprint(symbol,timeframe,candle,decision["event_state"],decision["level"])})
-    # Persist confirmed/false events once per group; UNIQUE(symbol,timeframe,
-    # candle_open,event_type) keeps repeated cycles idempotent.
-    for item in evaluations:
-        if item["event_state"] not in {"BREAKOUT_CONFIRMED","BREAKDOWN_CONFIRMED","FALSE_BREAKOUT_RISK","FALSE_BREAKDOWN_RISK"}:
-            continue
-        opened=pd.Timestamp(item["candle"]).to_pydatetime(); closed=opened+timeframe_delta(timeframe)
-        await BOT.db.execute("""INSERT INTO breakout_events(symbol,timeframe,candle_open,candle_close,event_type,level,close_price,volume_ratio,body_strength)
-              VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING""",
-            symbol,timeframe,opened,closed,item["event_state"].replace("_RISK",""),item["level"],item["q"]["last"],
-            item["q"]["breakout"]["volume_ratio"],item["q"]["breakout"]["body_strength"])
-    BOT.last_alert_cycle={"groups":row_count,"symbol":symbol,"timeframe":timeframe}
-    return evaluations
-
-
 async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Monitor closed candles and notify only when state changes.
-
-    Cost model: alerts are GROUPED by (symbol,timeframe) and paged (the old
-    "LIMIT 100" silently dropped everyone past the hundredth monitor), so ten
-    watchers of BTC/USDT 4h cost one fetch, not ten. A group is only re-fetched
-    once its newest closed candle can actually have changed.
-    """
+    """Monitor closed candles and notify only when state changes."""
     assert BOT is not None
     if not BOT.db: return
-    rows: list[Any] = []
-    cursor=0
-    while True:
-        batch=await BOT.db.fetch("SELECT * FROM alerts WHERE active AND id>$1 ORDER BY id LIMIT 500",cursor)
-        if not batch: break
-        rows.extend(batch); cursor=batch[-1]["id"]
-    groups: dict[tuple[str,str],list[Any]]=defaultdict(list)
-    for row in rows: groups[(row["symbol"],row["timeframe"])].append(row)
-    for (symbol,timeframe),group in groups.items():
-        try:
-            evaluations=await _evaluate_alert_group(symbol,timeframe,len(group))
-        except Exception:
-            log.exception("Alert group failed %s %s",symbol,timeframe); continue
-        if not evaluations: continue
-        for row in group:
-            try:
-                await _notify_alert_row(context,row,evaluations)
-            except Exception:
-                log.exception("Alert check failed id=%s",row["id"])
-    try:
-        await check_price_levels(context)
-    except Exception:
-        log.exception("Price-level check failed")
-    BOT.last_alert_scan=datetime.now(timezone.utc)
-
-
-async def check_price_levels(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """One ticker per symbol serves every stored price level on that symbol."""
-    assert BOT is not None
-    if not BOT.db: return
-    rows=await BOT.db.fetch("SELECT id,telegram_id,chat_id,symbol,level,direction,repeat FROM price_levels WHERE active")
-    if not rows: return
-    prices: dict[str,float]={}
-    for symbol in {row["symbol"] for row in rows}:
-        live=await BOT.fetch_live_price(symbol)
-        prices[symbol]=float(live.get("price") or 0)
+    rows=await BOT.db.fetch("SELECT * FROM alerts WHERE active ORDER BY id LIMIT 100")
     for row in rows:
-        price=prices.get(row["symbol"],0.0)
-        if not price_level_triggered(float(row["level"]),row["direction"],price): continue
         try:
-            await context.bot.send_message(row["chat_id"],
-                f"🎯 Price level hit\n{row['symbol']} {'≥' if row['direction']=='above' else '≤'} "
-                f"{float(row['level']):.8g}\nবর্তমান দাম: {price:.8g}\n\nএটি আর্থিক পরামর্শ নয়।")
-            if row["repeat"]:
-                await BOT.db.execute("UPDATE price_levels SET last_fired_at=NOW() WHERE id=$1",row["id"])
-            else:
-                await BOT.db.execute("UPDATE price_levels SET active=FALSE,last_fired_at=NOW() WHERE id=$1",row["id"])
-        except Exception:
-            log.exception("Price level notify failed id=%s",row["id"])
-
-
-async def _notify_alert_row(context: ContextTypes.DEFAULT_TYPE, row: Any, evaluations: list[dict[str,Any]]) -> None:
-    """Send at most one message per state change, using the group's evaluations."""
-    assert BOT is not None
-    prev_state=row["last_state"]; prev_fingerprint=row["last_fingerprint"]
-    newest=evaluations[-1]
-    for item in evaluations:
-        q=item["q"]; bo=q["breakout"]; event_state=item["event_state"]
-        if (alert_is_wanted(item["category"],item["strong"],row["event_filter"])
-                and item["fingerprint"]!=prev_fingerprint and event_state!=prev_state):
-            shown_live=item.get("live_price")
-            live_line=("বর্তমান Binance price: "
-                       + (f"{shown_live:.8g}" if shown_live else "সাময়িকভাবে unavailable") + "\n")
-            await context.bot.send_message(row["chat_id"],
-                f"🚨 {row['symbol']} • {row['timeframe']}\nEvent: {colored_state(event_state)}\n{live_line}"
-                f"Signal closed candle: {item['candle'][:16]} UTC\nSignal close: {q['last']:.8g}\n"
-                f"Bull trigger: {bo['bullish_trigger']:.8g}\nBear trigger: {bo['bearish_trigger']:.8g}\n"
-                f"Volume: {bo['volume_ratio']:.2f}x\n\nConfirmation closed candle-এর; live price শুধু বর্তমান reference। এটি আর্থিক পরামর্শ নয়।")
-        prev_state=event_state; prev_fingerprint=item["fingerprint"]
-    await BOT.db.execute("UPDATE alerts SET last_state=$1,last_candle=$2,last_fingerprint=$3 WHERE id=$4",
-                         newest["event_state"],newest["candle"],newest["fingerprint"],row["id"])
+            req=Request(row['symbol'],row['timeframe']); frame,live=await asyncio.gather(BOT.fetch_candles(req,force=True),BOT.fetch_live_price(req.symbol)); q=quant_snapshot(frame); state=q['breakout']['state']; candle=frame.index[-1].isoformat()
+            # Confirmed states remain closed-candle only. Otherwise use the live
+            # ticker to provide timely approaching alerts without falsely calling
+            # an intrabar wick a confirmed breakout.
+            live_price=float(live.get('price') or q['last']); bo=q['breakout']
+            if "CONFIRMED" not in state:
+                up_distance=(float(bo['bullish_trigger'])-live_price)/live_price*100
+                down_distance=(live_price-float(bo['bearish_trigger']))/live_price*100
+                if up_distance<=1.0 and up_distance<=down_distance: state="APPROACHING_BREAKOUT"
+                elif down_distance<=1.0: state="APPROACHING_BREAKDOWN"
+            retest=retest_state(frame,q['breakout']); event_state=retest['state'] if retest['state'] not in {"NOT_APPLICABLE","NO_RETEST_DATA","WAITING_FOR_RETEST"} else state
+            category=("retest" if "RETEST" in event_state else "confirmed" if "CONFIRMED" in event_state else "false" if "FALSE" in event_state else "approaching" if "APPROACHING" in event_state else "volume" if q['breakout']['volume_ratio']>=2 else None)
+            strong=("CONFIRMED" in event_state and q['breakout']['volume_ratio']>=1.5 and q['breakout']['body_strength']>=.60)
+            level=float(retest.get('level') or q['breakout']['bullish_trigger']); fingerprint=event_fingerprint(req.symbol,req.timeframe,candle,event_state,level)
+            wanted=(category is not None and row['event_filter']=="all") or row['event_filter']==category or (row['event_filter']=="strict" and strong)
+            # Persist confirmed/false events on every monitor pass. UNIQUE keeps
+            # the three-minute worker from duplicating the same closed candle.
+            persist_type=event_state if event_state in {"BREAKOUT_CONFIRMED","BREAKDOWN_CONFIRMED","FALSE_BREAKOUT_RISK","FALSE_BREAKDOWN_RISK"} else None
+            if persist_type and event_state != row['last_state']:
+                normalized_type=persist_type.replace("_RISK","")
+                opened=frame.index[-1].to_pydatetime(); closed=opened+timeframe_delta(req.timeframe)
+                await BOT.db.execute("""INSERT INTO breakout_events(symbol,timeframe,candle_open,candle_close,event_type,level,close_price,volume_ratio,body_strength)
+                  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING""",req.symbol,req.timeframe,opened,closed,normalized_type,level,q['last'],q['breakout']['volume_ratio'],q['breakout']['body_strength'])
+            if wanted and fingerprint != row['last_fingerprint'] and event_state != row['last_state']:
+                bo=q['breakout']
+                live_line=f"বর্তমান Binance price: {live_price:.8g}\n"
+                await context.bot.send_message(row['chat_id'],f"🚨 {req.symbol} • {req.timeframe}\nEvent: {colored_state(event_state)}\n{live_line}Signal closed candle: {candle[:16]} UTC\nSignal close: {q['last']:.8g}\nBull trigger: {bo['bullish_trigger']:.8g}\nBear trigger: {bo['bearish_trigger']:.8g}\nVolume: {bo['volume_ratio']:.2f}x\n\nConfirmation closed candle-এর; live price শুধু বর্তমান reference। এটি আর্থিক পরামর্শ নয়।")
+            await BOT.db.execute("UPDATE alerts SET last_state=$1,last_candle=$2,last_fingerprint=$3 WHERE id=$4",event_state,candle,fingerprint,row['id'])
+        except Exception: log.exception("Alert check failed id=%s",row['id'])
+    BOT.last_alert_scan=datetime.now(timezone.utc)
 
 async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
@@ -3907,8 +2305,7 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     rows=await BOT.db.fetch("SELECT * FROM (SELECT p.*,ROW_NUMBER() OVER(PARTITION BY telegram_id ORDER BY id) AS display_no FROM paper_trades p WHERE status='active') ranked WHERE enabled ORDER BY id LIMIT 100")
     for r in rows:
         try:
-            ticker,candles=await asyncio.gather(BOT.fetch_live_price(r['symbol']),
-                                                BOT._fetch_ohlcv_with_fallback(r['symbol'],'1m',2,(r['symbol'],'1m')))
+            ticker,candles=await asyncio.gather(BOT.fetch_live_price(r['symbol']),BOT.exchange.fetch_ohlcv(r['symbol'],'1m',limit=2))
             live=float(ticker.get('price') or 0); closed=candles[-2] if len(candles)>1 else candles[-1]
             high=max(live,float(closed[2])); low=min(live,float(closed[3])); long=r['direction']=="long"
             stop_hit=(low<=r['stop']) if long else (high>=r['stop'])
@@ -3976,206 +2373,18 @@ async def subscription_expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             try: await context.bot.send_message(r['telegram_id'],"আপনার Pro access ৩ দিনের মধ্যে শেষ হবে।")
             except Exception: pass
 
-async def scorecard_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fill in what actually happened after each stored breakout event."""
-    del context
-    assert BOT is not None
-    if not BOT.db: return
-    try:
-        rows=await BOT.db.fetch("""SELECT id,symbol,timeframe,candle_close,event_type,close_price
-                                     FROM breakout_events
-                                     WHERE evaluated_at IS NULL AND candle_close<NOW()-INTERVAL '2 hours'
-                                     ORDER BY candle_close DESC LIMIT 200""")
-    except Exception:
-        log.exception("Scorecard query failed"); return
-    groups: dict[tuple[str,str],list[Any]]=defaultdict(list)
-    for row in rows: groups[(row["symbol"],row["timeframe"])].append(row)
-    evaluated=0
-    for (symbol,timeframe),events in groups.items():
-        try:
-            frame=await BOT.fetch_candles(Request(symbol,timeframe),force=True)
-        except Exception:
-            log.warning("Scorecard: candles unavailable for %s %s",symbol,timeframe); continue
-        for event in events:
-            move=event_follow_through(frame,event["candle_close"],float(event["close_price"] or 0),
-                                      str(event["event_type"]))
-            if move is None: continue      # window not formed yet
-            try:
-                await BOT.db.execute("UPDATE breakout_events SET max_follow_through_pct=$1,evaluated_at=NOW() WHERE id=$2",
-                                     move,event["id"])
-                evaluated+=1
-            except Exception:
-                log.exception("Scorecard update failed id=%s",event["id"])
-    if evaluated:
-        log.info("Scorecard evaluated %d event(s)",evaluated)
-
-
-async def build_daily_report(bot_instance: Any = None) -> str:
-    """Assemble the daily market report text (also used by /report)."""
-    bot_instance=bot_instance or BOT
-    assert bot_instance is not None
-    async def movers():
-        try:
-            payload=await http_json("https://api.binance.com/api/v3/ticker/24hr")
-            return top_movers(payload,5)
-        except Exception as exc:
-            log.warning("Binance movers unavailable (%s); trying OKX",exc)
-        try:
-            payload=await http_json("https://www.okx.com/api/v5/market/tickers?instType=SPOT")
-            return top_movers(parse_okx_tickers(payload),5)
-        except Exception as exc:
-            log.warning("Daily report movers unavailable: %s",exc); return {"gainers":[],"losers":[]}
-    market,sentiment,move=await asyncio.gather(bot_instance.market_filter("4h"),
-                                               bot_instance.market_sentiment(),movers(),
-                                               return_exceptions=True)
-    market={} if isinstance(market,Exception) else (market or {})
-    sentiment={} if isinstance(sentiment,Exception) else (sentiment or {})
-    move={"gainers":[],"losers":[]} if isinstance(move,Exception) else move
-    lines=["📅 Daily crypto market report", ""]
-    btc=(market.get("btc") or {}); eth=(market.get("eth") or {})
-    if btc or eth:
-        lines.append(f"BTC: {btc.get('structure','?')} · RSI {float(btc.get('rsi') or 0):.1f} · "
-                     f"{'EMA50 উপরে' if btc.get('above_ema50') else 'EMA50 নিচে'}")
-        lines.append(f"ETH: {eth.get('structure','?')} · RSI {float(eth.get('rsi') or 0):.1f} · "
-                     f"{'EMA50 উপরে' if eth.get('above_ema50') else 'EMA50 নিচে'}")
-        lines.append("Market filter: " + ("🟢 risk-on" if market.get("risk_on") else "🔴 risk-off"))
-    fear=(sentiment.get("fear_greed") or {})
-    if fear:
-        lines.append(f"Fear & Greed: {fear.get('value')} ({fear.get('label')})")
-    if sentiment.get("btc_dominance") is not None:
-        lines.append(f"BTC dominance: {sentiment['btc_dominance']}% · 24h market cap "
-                     f"{sentiment.get('market_cap_change_24h')}%")
-    if move["gainers"]:
-        # On a fully red day the best performers are still negative; label the
-        # section honestly instead of calling a -3% move a "gainer".
-        header=("\n🚀 Top gainers (24h, liquid pairs):" if move["gainers"][0]["change"]>0
-                else "\n🥇 সবচেয়ে ভালো পারফর্মার (24h, আজ সবই নেতিবাচক):")
-        lines.append(header)
-        lines += [f"• {row['symbol']} {row['change']:+.2f}% (${row['price']:.8g}, vol ${row['volume']}M)"
-                  for row in move["gainers"]]
-    if move["losers"]:
-        header=("\n🔻 Top losers:" if move["losers"][0]["change"]<0
-                else "\n📉 সবচেয়ে দুর্বল (24h):")
-        lines.append(header)
-        lines += [f"• {row['symbol']} {row['change']:+.2f}% (${row['price']:.8g}, vol ${row['volume']}M)"
-                  for row in move["losers"]]
-    lines.append("\nঅ্যানালাইসিস শিক্ষামূলক, আর্থিক পরামর্শ নয়।")
-    return "\n".join(lines)
-
-
-async def daily_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Post the daily report to the configured channel (falls back to admins)."""
-    assert BOT is not None
-    try:
-        text=await build_daily_report()
-    except Exception:
-        log.exception("Daily report build failed"); return
-    targets=[]
-    if PRICE_ALERT_CHANNEL_ID:
-        try: targets.append(int(PRICE_ALERT_CHANNEL_ID))
-        except ValueError: log.warning("PRICE_ALERT_CHANNEL_ID is not numeric")
-    if not targets: targets=sorted(ADMIN_IDS)
-    for chat_id in targets:
-        try: await context.bot.send_message(chat_id,text)
-        except Exception: log.warning("Daily report to %s failed",chat_id)
-
-
-async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin-only manual trigger so the daily report can be checked immediately."""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.effective_message.reply_text("Admin only."); return
-    await update.effective_message.reply_text(await build_daily_report())
-
-
-async def analyses_retention_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Trim the analyses table: one JSON payload per request adds up fast.
-
-    Indexed lookups (idx_analyses_lookup) keep the very common "previous
-    analysis" query cheap while old rows are dropped after N days.
-    """
-    del context
-    assert BOT is not None
-    if not BOT.db: return
-    try:
-        deleted=await BOT.db.execute("DELETE FROM analyses WHERE created_at < NOW() - $1::interval",
-                                     f"{ANALYSES_RETENTION_DAYS} days")
-        log.info("Analyses retention: %s (keep %d days)", deleted, ANALYSES_RETENTION_DAYS)
-    except Exception:
-        log.exception("Analyses retention job failed")
-
-
-# One admin ping per exception type per window: a broken loop must not turn the
-# error handler itself into a flood.
-ERROR_ALERT_WINDOW_SECONDS = 60.0
-_error_alert_seen: dict[str,float] = {}
-
-
-def _error_alert_text(update: object, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Short, copy-pasteable summary of a failure for the admins."""
-    error=context.error
-    where="unknown update"
-    try:
-        if isinstance(update, Update):
-            bits=[]
-            if update.effective_user: bits.append(f"user={update.effective_user.id}")
-            if update.effective_chat: bits.append(f"chat={update.effective_chat.id}")
-            message=getattr(update,"effective_message",None)
-            if message and getattr(message,"text",None): bits.append(f"text={message.text[:60]!r}")
-            if getattr(update,"callback_query",None) and update.callback_query.data:
-                bits.append(f"callback={update.callback_query.data[:40]}")
-            where=", ".join(bits) or str(update.update_id)
-        elif update is not None:
-            where=type(update).__name__
-    except Exception:
-        where="unknown update"
-    chain="".join(traceback.format_exception(type(error),error,error.__traceback__))
-    return (f"🚨 <b>Bot error</b>\n"
-            f"Type: <code>{html.escape(type(error).__name__)}</code>\n"
-            f"Message: {html.escape(str(error))[:300]}\n"
-            f"Where: {html.escape(where)[:200]}\n\n"
-            f"<pre>{html.escape(chain[-700:])}</pre>")
-
-
-async def notify_admins_of_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send critical failures to ADMIN_USER_IDS (no Sentry/extra env needed)."""
-    error=context.error
-    if isinstance(error,(RetryAfter,TimedOut,BadRequest)) or not ADMIN_IDS:
-        return   # expected Telegram conditions; they are logged only
-    signature=type(error).__name__
-    now=time.monotonic()
-    if now-_error_alert_seen.get(signature,0.0)<ERROR_ALERT_WINDOW_SECONDS:
-        return
-    _error_alert_seen[signature]=now
-    text=_error_alert_text(update,context)
-    for admin_id in ADMIN_IDS:
-        try: await context.bot.send_message(admin_id,text,parse_mode=ParseMode.HTML)
-        except Exception: log.warning("Could not send error alert to admin %s",admin_id)
-
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, RetryAfter):
         log.warning("Telegram flood control: retry after %s", context.error.retry_after)
     else:
         log.exception("Telegram update failed", exc_info=context.error)
-    try:
-        await notify_admins_of_error(update,context)
-    except Exception:
-        # Never let the notifier break the error path itself.
-        log.warning("Admin error notification failed", exc_info=True)
 
-PUBLIC_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("guide","ব্যবহার নির্দেশিকা"),BotCommand("subscribe","Packages ও approval"),
- BotCommand("invite","Invite link ও reward"),BotCommand("trial","Free trial"),
- BotCommand("paid","USDT (TRC20) পেমেন্ট")]
+PUBLIC_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("guide","ব্যবহার নির্দেশিকা"),BotCommand("subscribe","Packages ও approval")]
 PRO_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("guide","Interactive guide"),BotCommand("settings","Report settings"),
  BotCommand("monitor","Strong breakout monitor"),BotCommand("alerts","Active monitors"),BotCommand("watchlist","Watchlist ও monitoring"),
  BotCommand("watchlist_remove","Watchlist থেকে coin বাদ"),BotCommand("watchlist_clear","Watchlist পরিষ্কার"),
- BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("futures","Futures Trade Manager"),
- BotCommand("calc","Futures calculator"),BotCommand("risk","Position size"),
- BotCommand("backtest","Backtest (fees, slippage)"),BotCommand("scorecard","Signal scorecard"),
- BotCommand("mtf","15m/1h/4h/1d confluence"),BotCommand("level","Price-level alert"),
- BotCommand("portfolio","Portfolio & PnL")]
-ADMIN_COMMANDS_ONLY=[BotCommand("report","Daily market report (admin)"),BotCommand("referrals","Referral report")]
-ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("price_alert","Channel price card ON/Update"),BotCommand("price_alerts","Channel price card ON/OFF list"),BotCommand("admin","Admin panel"),BotCommand("stats","System statistics")]+ADMIN_COMMANDS_ONLY
+ BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("futures","Futures Trade Manager")]
+ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("price_alert","Channel price card ON/Update"),BotCommand("price_alerts","Channel price card ON/OFF list"),BotCommand("admin","Admin panel"),BotCommand("stats","System statistics")]
 
 async def set_user_menu(bot: Any,user_id:int,plan:str) -> None:
     commands=ADMIN_COMMANDS if plan=="admin" else PRO_COMMANDS if plan=="pro" else PUBLIC_COMMANDS
@@ -4191,16 +2400,7 @@ async def post_init(application: Application) -> None:
         for row in rows: await set_user_menu(application.bot,row['telegram_id'],"pro")
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     if application.job_queue:
-        # ALERT_INTERVAL_SECONDS was defined but never used: the monitor ran on a
-        # hard-coded 60s whatever the env said. It is the effective interval now.
-        application.job_queue.run_repeating(alert_job, interval=ALERT_INTERVAL, first=20, name="breakout-alert-monitor")
-        application.job_queue.run_repeating(analyses_retention_job, interval=6*3600, first=180, name="analyses-retention")
-        application.job_queue.run_repeating(scorecard_job, interval=3600, first=300, name="signal-scorecard")
-        # Only does anything when USDT_TRC20_ADDRESS is set.
-        application.job_queue.run_repeating(usdt_verify_job, interval=180, first=150, name="usdt-auto-verify")
-        application.job_queue.run_daily(daily_report_job,
-                                       time=dt_time(hour=DAILY_REPORT_UTC_HOUR, minute=0, tzinfo=timezone.utc),
-                                       name="daily-market-report")
+        application.job_queue.run_repeating(alert_job, interval=60, first=20, name="breakout-alert-monitor")
         application.job_queue.run_repeating(trade_job, interval=60, first=35, name="paper-trade-monitor")
         application.job_queue.run_repeating(channel_price_job, interval=60, first=45, name="channel-price-cards")
         application.job_queue.run_repeating(subscription_expiry_job, interval=3600, first=60, name="subscription-expiry")
@@ -4238,17 +2438,7 @@ def main() -> None:
     app.add_handler(CommandHandler("settings", protected(settings_command)))
     app.add_handler(CommandHandler("history", protected(history_command)))
     app.add_handler(CommandHandler("risk", protected(risk_command)))
-    app.add_handler(CommandHandler("calc", protected(calc_command)))
     app.add_handler(CommandHandler("backtest", protected(backtest_command)))
-    app.add_handler(CommandHandler("scorecard", protected(scorecard_command)))
-    app.add_handler(CommandHandler("mtf", protected(mtf_command)))
-    app.add_handler(CommandHandler("invite", invite_command))
-    app.add_handler(CommandHandler("trial", trial_command))
-    app.add_handler(CommandHandler("paid", paid_command))
-    app.add_handler(CommandHandler("referrals", referrals_command))
-    app.add_handler(CommandHandler("level", protected(level_command)))
-    app.add_handler(CommandHandler("portfolio", protected(portfolio_command)))
-    app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("scanner", protected(scanner_command)))
     app.add_handler(CommandHandler("price_alert", price_alert_command))
     app.add_handler(CommandHandler("price_alert_off", price_alert_off_command))
@@ -4264,16 +2454,6 @@ def main() -> None:
             FUT_TP3:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_tp3)],
         },fallbacks=[CommandHandler("cancel",futures_cancel)],allow_reentry=True)
     app.add_handler(futures_conversation)
-    # TrxID capture: sits BEFORE the catch-all CallbackQueryHandler so the
-    # "Request Approval" callback can ask a follow-up question first.
-    subscription_conversation=ConversationHandler(
-        entry_points=[CallbackQueryHandler(subreq_begin,pattern=r"^subreq\|")],
-        states={SUBSCRIPTION_TRX:[MessageHandler(filters.TEXT & ~filters.COMMAND,subreq_trx),
-                                  CallbackQueryHandler(subreq_skip,pattern=r"^subreqskip\|"),
-                                  CallbackQueryHandler(subreq_cancel,pattern=r"^subreqcancel$")]},
-        fallbacks=[CommandHandler("cancel",subscription_cancel_command)],
-        allow_reentry=True,conversation_timeout=900)
-    app.add_handler(subscription_conversation)
     app.add_handler(CommandHandler("timezone", protected(timezone_command)))
     app.add_handler(CommandHandler("health", protected(health_command)))
     app.add_handler(CommandHandler("alert", protected(alert_command)))
