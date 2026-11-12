@@ -10,7 +10,7 @@ import asyncio
 import html
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone   # `time` is the stdlib module here
 
 import aiohttp
 import asyncpg
@@ -4199,7 +4199,7 @@ async def post_init(application: Application) -> None:
         # Only does anything when USDT_TRC20_ADDRESS is set.
         application.job_queue.run_repeating(usdt_verify_job, interval=180, first=150, name="usdt-auto-verify")
         application.job_queue.run_daily(daily_report_job,
-                                       time=datetime.time(hour=DAILY_REPORT_UTC_HOUR, minute=0, tzinfo=timezone.utc),
+                                       time=dt_time(hour=DAILY_REPORT_UTC_HOUR, minute=0, tzinfo=timezone.utc),
                                        name="daily-market-report")
         application.job_queue.run_repeating(trade_job, interval=60, first=35, name="paper-trade-monitor")
         application.job_queue.run_repeating(channel_price_job, interval=60, first=45, name="channel-price-cards")
