@@ -122,9 +122,9 @@ log = logging.getLogger("crypto_analyst")
 # --------------------------------------------------------------------------
 # Timeframes and candle-range planning
 # --------------------------------------------------------------------------
-TF_LADDER = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1mo"]
+TF_LADDER = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1mo", "3mo"]
 TF_MIN = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120, "4h": 240, "6h": 360,
-          "8h": 480, "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080, "1mo": 43200}
+          "8h": 480, "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080, "1mo": 43200, "3mo": 129600}
 MIN_TO_TF = {v: k for k, v in TF_MIN.items()}
 MAX_RANGE_DAYS = 365
 MAX_VIEW_CANDLES = 500
@@ -135,7 +135,18 @@ RANGE_AUTO_TF = [(1, "15m"), (3, "30m"), (7, "1h"), (14, "2h"), (30, "4h"), (60,
 
 
 def tf_label(tf: str) -> str:
-    return "1M" if tf == "1mo" else tf.upper()
+    """Plain ASCII on purpose: it is also drawn on the chart, whose font has no Bengali glyphs."""
+    return {"1w": "1 Week", "1mo": "1 Month", "3mo": "3 Months"}.get(tf, tf.upper())
+
+
+def range_label_en(days: int) -> str:
+    if days % 365 == 0:
+        return f"{days // 365} Year" + ("s" if days > 365 else "")
+    if days % 30 == 0 and days >= 30:
+        return f"{days // 30} Month" + ("s" if days > 30 else "")
+    if days % 7 == 0 and days >= 7:
+        return f"{days // 7} Week" + ("s" if days > 7 else "")
+    return f"{days} Days"
 
 
 def range_label(days: int) -> str:
@@ -289,7 +300,7 @@ UNIT_ALIASES = _ndict({
 })
 RANGE_CTX = _nset("last", "past", "previous", "recent", "গত", "শেষ", "পুরো", "whole", "full", "এই", "this", "ei", "gato", "goto")
 WORD_TF = _ndict({"daily": "1d", "দৈনিক": "1d", "ডেইলি": "1d", "weekly": "1w", "সাপ্তাহিক": "1w", "উইকলি": "1w", "monthly": "1mo",
-                  "মাসিক": "1mo", "মান্থলি": "1mo", "hourly": "1h"})
+                  "মাসিক": "1mo", "মান্থলি": "1mo", "hourly": "1h", "quarterly": "3mo", "ত্রৈমাসিক": "3mo", "কোয়ার্টারলি": "3mo"})
 COMPACT = re.compile(r"^(\d+(?:\.\d+)?)([a-zঀ-৿]+)$")
 NUMBER = re.compile(r"^\d+(?:\.\d+)?$")
 NUMBER_K = re.compile(r"^(\d+(?:\.\d+)?)k$")
@@ -449,13 +460,17 @@ def scan_durations(tokens: list[str]) -> tuple[list[dict[str, Any]], set[int]]:
             else:
                 item.update(kind="range", days=max(1, int(math.ceil(value))))
         elif unit == "week":
-            if compact and value == 1 and not prev_ctx:
+            if value == 1 and not prev_ctx:
+                # "1 week" = one candle per week. Written in words it may also mean a 7-day window when another timeframe is given.
                 item.update(kind="tf", minutes=10080, tf="1w")
+                if not compact: item["alt_days"] = 7
             else:
                 item.update(kind="range", days=max(1, int(math.ceil(value * 7))), weekish=True)
         elif unit == "month":
-            if compact and value == 1 and not prev_ctx:
-                item.update(kind="tf", minutes=43200, tf="1mo")
+            if value in (1, 3) and not prev_ctx:
+                # "1 month" / "3 month" = one candle per month / per quarter.
+                item.update(kind="tf", minutes=43200 * int(value), tf="1mo" if value == 1 else "3mo")
+                if not compact: item["alt_days"] = int(value) * 30
             else:
                 item.update(kind="range", days=max(1, int(math.ceil(value * 30))), monthish=True)
         elif unit == "year":
@@ -698,6 +713,11 @@ def understand(text: str, known_bases: set[str] | None = None) -> NLUResult:
         return res
 
     durations, consumed = scan_durations(tokens)
+    if any(d["kind"] == "tf" and "alt_days" not in d for d in durations):
+        # A real timeframe ("4h", "1d") is present, so "1 month" can only be the visible window.
+        for d in durations:
+            if d["kind"] == "tf" and "alt_days" in d:
+                d.update(kind="range", days=d["alt_days"])
     tf_items = [d for d in durations if d["kind"] == "tf"]
     range_items = [d for d in durations if d["kind"] == "range"]
     valid_tfs: list[str] = []
@@ -763,7 +783,7 @@ def understand(text: str, known_bases: set[str] | None = None) -> NLUResult:
             opts = [_opt(intent if intent != "price_alert" else "analysis", sym, t, res.range_days) for t in near]
         else:
             opts = [_opt(intent if intent in COIN_REQUIRED else "analysis", c, near[0] if near else None, res.range_days) for c in POPULAR_COINS[:2]]
-        return ask(f"{shown}-এর timeframe Binance-এ নেই। সমর্থিত timeframe: " + ", ".join(tf_label(t) for t in TF_LADDER if t != "1mo") + " (এবং 1M)।\nনিচের কোনটা চান?", opts)
+        return ask(f"{shown}-এর timeframe Binance-এ নেই। সমর্থিত timeframe: " + ", ".join(tf_label(t) for t in TF_LADDER) + "।\nনিচের কোনটা চান?", opts)
     if len(valid_tfs) > 1 and intent in COIN_REQUIRED:
         sym = res.symbol
         if sym:
@@ -982,7 +1002,7 @@ def _assign_calc(out: dict[str, Any], key: str, value: float | None) -> None:
 # ==========================================================================
 TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
          "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000, "3d": 259_200_000,
-         "1w": 604_800_000, "1mo": 2_592_000_000}
+         "1w": 604_800_000, "1mo": 2_592_000_000, "3mo": 7_776_000_000}
 # Rows one request can return on each venue (OKX history endpoint is the smallest).
 PAGE_LIMIT = {"binance": 1000, "bybit": 1000, "okx": 100}
 GEO_HINTS = ("restricted location", "451", "403", "forbidden", "geo", "not available in your", "access denied")
@@ -990,11 +1010,27 @@ GEO_HINTS = ("restricted location", "451", "403", "forbidden", "geo", "not avail
 
 def ccxt_timeframe(tf: str) -> str:
     """Internal "1mo" is monthly; ccxt spells monthly "1M" (and "1m" is one minute!)."""
-    return "1M" if tf == "1mo" else tf
+    return "1M" if tf in ("1mo", "3mo") else tf      # exchanges have no 3-month candle: it is built from monthly ones
 
 
 def min_closed_candles(tf: str) -> int:
-    return {"1mo": 36, "1w": 60}.get(tf, 100)
+    return {"1mo": 36, "3mo": 12, "1w": 60}.get(tf, 100)
+
+
+def aggregate_quarters(rows: list[list[float]]) -> list[list[float]]:
+    """Monthly candles -> calendar-quarter candles (Jan-Mar, Apr-Jun, ...). Only quarters with all three closed months are kept,
+    so neither a half-listed first quarter nor the quarter still in progress is ever drawn."""
+    groups: dict[tuple[int, int], list[list[float]]] = {}
+    for row in rows:
+        moment = datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc)
+        groups.setdefault((moment.year, (moment.month - 1) // 3), []).append(row)
+    out = []
+    for key in sorted(groups):
+        months = sorted(groups[key], key=lambda r: r[0])
+        if len({datetime.fromtimestamp(r[0] / 1000, tz=timezone.utc).month for r in months}) != 3:
+            continue
+        out.append([months[0][0], months[0][1], max(r[2] for r in months), min(r[3] for r in months), months[-1][4], sum(r[5] for r in months)])
+    return out
 
 
 async def fetch_ohlcv_paged(fetch: Callable[..., Awaitable[list[list[float]]]], symbol: str, timeframe: str, total: int,
@@ -1434,7 +1470,7 @@ def event_fingerprint(symbol:str,timeframe:str,candle:str,state:str,level:float)
 # ---------------------------------------------------------------------------
 # Multi-timeframe confluence
 # ---------------------------------------------------------------------------
-MTF_WEIGHT = {"5m": 1, "15m": 1, "30m": 1.5, "1h": 2, "2h": 2, "4h": 3, "6h": 3, "8h": 3, "12h": 3.5, "1d": 4, "3d": 4, "1w": 4, "1mo": 4}
+MTF_WEIGHT = {"5m": 1, "15m": 1, "30m": 1.5, "1h": 2, "2h": 2, "4h": 3, "6h": 3, "8h": 3, "12h": 3.5, "1d": 4, "3d": 4, "1w": 4, "1mo": 4, "3mo": 4}
 MTF_DEFAULT_SET = ("15m", "1h", "4h", "1d")
 
 
@@ -1513,7 +1549,7 @@ def mtf_text(c: dict[str, Any], lang: str = "bn") -> str:
 # ---------------------------------------------------------------------------
 FUTURES_PERIODS = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
 _PERIOD_MIN = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440}
-_TF_MIN = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120, "4h": 240, "6h": 360, "8h": 480, "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080, "1mo": 43200}
+_TF_MIN = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120, "4h": 240, "6h": 360, "8h": 480, "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080, "1mo": 43200, "3mo": 129600}
 
 
 def futures_period(timeframe: str) -> str:
@@ -1955,7 +1991,7 @@ ADMIN_CONTACT_NAME = os.getenv("ADMIN_CONTACT_NAME", "—͞Tᴍ Mᴜsᴀ").strip
 ADMIN_CONTACT_USERNAME = os.getenv("ADMIN_CONTACT_USERNAME", "tmmusa73").strip().lstrip("@")
 PRICE_ALERT_CHANNEL_ID = os.getenv("PRICE_ALERT_CHANNEL_ID", "").strip()
 PRICE_CARD_BRAND = os.getenv("PRICE_CARD_BRAND", "@cryptoaiteacherbot").strip()
-SUPPORTED_TF = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1mo"}
+SUPPORTED_TF = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1mo", "3mo"}
 EXCHANGE_NAMES = ["binance"] + [x.strip().lower() for x in os.getenv("EXCHANGE_FALLBACKS", "bybit,okx").split(",") if x.strip() and x.strip().lower() != "binance"]
 ANALYSES_RETENTION_DAYS = _env_int("ANALYSES_RETENTION_DAYS", 30, 7, 3650)
 LEVEL_ALERT_INTERVAL = _env_int("LEVEL_ALERT_INTERVAL_SECONDS", 30, 15, 600)
@@ -2150,6 +2186,7 @@ def quant_snapshot(df: pd.DataFrame) -> dict[str, Any]:
 
 def timeframe_delta(timeframe: str) -> timedelta:
     if timeframe=="1mo": return timedelta(days=30)
+    if timeframe=="3mo": return timedelta(days=91)
     unit=timeframe[-1].lower(); value=int(timeframe[:-1])
     return {"m":timedelta(minutes=value),"h":timedelta(hours=value),"d":timedelta(days=value),"w":timedelta(weeks=value)}[unit]
 
@@ -2472,10 +2509,10 @@ class AnalystBot:
     @staticmethod
     def _normalize_tf(raw: str) -> str:
         text = raw.strip().lower().replace(" ", "")
-        aliases = {"60m": "1h", "240m": "4h", "hour": "1h", "day": "1d", "daily": "1d", "weekly": "1w", "1mo": "1mo", "monthly": "1mo", "month": "1mo"}
+        aliases = {"60m": "1h", "240m": "4h", "hour": "1h", "day": "1d", "daily": "1d", "weekly": "1w", "1mo": "1mo", "monthly": "1mo", "month": "1mo", "3mo": "3mo", "quarterly": "3mo", "3month": "3mo", "3months": "3mo", "1month": "1mo", "1week": "1w"}
         text = aliases.get(text, text)
         if text not in SUPPORTED_TF:
-            raise UserInputError("সমর্থিত timeframe: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1mo।")
+            raise UserInputError("সমর্থিত timeframe: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1mo, 3mo।")
         return text
 
     async def parse_text(self, text: str) -> Request:
@@ -2537,12 +2574,13 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
     async def fetch_candles(self, request: Request, force: bool = False, count: int | None = None) -> pd.DataFrame:
         """Closed candles for the request. ``count`` (or request.fetch_count) may exceed one exchange page; the pool pages and falls back."""
         want = max(min_closed_candles(request.timeframe), min(5000, int(count or request.fetch_count or CANDLE_LIMIT)))
+        quarterly = request.timeframe == "3mo"
         cache_key = f"ohlcv:{request.symbol}:{request.timeframe}:{want}"
         cached = None if force else self.cache.get(cache_key)
         if cached is not None:
             out = cached.copy(deep=True); out.attrs["source"] = cached.attrs.get("source", "binance"); return out
         try:
-            rows, source = await self.pool.ohlcv(request.symbol, request.timeframe, want + 1)
+            rows, source = await self.pool.ohlcv(request.symbol, "1mo" if quarterly else request.timeframe, want * 3 + 4 if quarterly else want + 1)
         except SymbolNotListed as exc:
             base = request.symbol.split("/")[0]
             near = difflib.get_close_matches(base, sorted(self.pool.usdt_bases()), n=3, cutoff=.75)
@@ -2557,19 +2595,20 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
             log.warning("Exchange error: %s", exc)
             raise UserInputError("Market data এখন পাওয়া যাচ্ছে না। একটু পরে চেষ্টা করুন।") from exc
         # Exchanges include the still-forming candle: drop it so a wick can never be called a confirmed breakout.
-        span_ms = 28 * 86_400_000 if request.timeframe == "1mo" else TF_MS[request.timeframe]
+        span_ms = 28 * 86_400_000 if request.timeframe in ("1mo", "3mo") else TF_MS[request.timeframe]
         now_ms = int(time.time() * 1000)
         if rows and rows[-1][0] + span_ms > now_ms:
             rows = rows[:-1]
+        if quarterly: rows = aggregate_quarters(rows)
         if len(rows) < min_closed_candles(request.timeframe):
             raise UserInputError("এই pair/timeframe-এর পর্যাপ্ত closed-candle history নেই।")
         frame = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
         frame.index = pd.to_datetime(frame.pop("timestamp"), unit="ms", utc=True)
         frame = frame.astype(float)
         frame.attrs["source"] = source
-        base_ttl = {"1m": 20, "3m": 30, "5m": 45, "15m": 90, "30m": 120, "1h": 180, "2h": 240, "4h": 300, "1d": 600, "1w": 900}.get(request.timeframe, 300)
+        base_ttl = {"1m": 20, "3m": 30, "5m": 45, "15m": 90, "30m": 120, "1h": 180, "2h": 240, "4h": 300, "1d": 600, "1w": 900, "1mo": 900, "3mo": 900}.get(request.timeframe, 300)
         ttl = base_ttl
-        if request.timeframe != "1mo":
+        if request.timeframe not in ("1mo", "3mo"):
             # Expire right after the next candle closes so alerts see a fresh closed candle immediately.
             ttl = max(5.0, min(base_ttl, (int(rows[-1][0]) + 2 * span_ms - now_ms) / 1000 + 2))
         self.cache.set(cache_key, frame.copy(deep=True), ttl)
@@ -2725,8 +2764,8 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         return sorted((x for x in scanned if not isinstance(x, BaseException)), reverse=True)[:keep]
 
     async def higher_timeframe(self, request: Request) -> dict[str, Any]:
-        order=["15m","1h","4h","1d","1w"]
-        higher = "1d" if request.timeframe not in ("1d","3d","1w") else "1w"
+        higher = "1d" if request.timeframe not in ("1d","3d","1w","1mo","3mo") else "1w" if request.timeframe in ("1d","3d") else "1mo"
+        if request.timeframe in ("1mo","3mo"): return {"timeframe":request.timeframe,"status":"unavailable"}
         try:
             other = await self.fetch_candles(Request(request.symbol, higher))
             q = quant_snapshot(other)
@@ -2737,7 +2776,7 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
 
     async def mtf_context(self, request: Request) -> dict[str, Any]:
         """15m/1h/4h/1d (plus the requested timeframe) bias and a weighted confluence score."""
-        wanted = {"15m", "1h", "4h", "1d", request.timeframe} - {"1mo", "1m", "3m"}
+        wanted = {"15m", "1h", "4h", "1d", request.timeframe} - {"1mo", "3mo", "1m", "3m"}
         order = sorted(wanted, key=lambda t: TF_MIN.get(t, 0))
         async def one(tf: str) -> dict[str, Any]:
             try:
@@ -2843,7 +2882,7 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
                     mpf.make_addplot(view.EMA50, color="#ffb300", width=1.0),
                     mpf.make_addplot(view.EMA200, color="#ab47bc", width=1.1)]
         source = str(frame.attrs.get("source", "binance")).title()
-        range_part = f" • {range_label(request.range_days)}" if request.range_days else ""
+        range_part = f" • last {range_label_en(request.range_days)}" if request.range_days else ""
         fig, axes = mpf.plot(view, type="candle", volume=True, style=style, figsize=(14, 8), addplot=overlays,
                              title=f"\n{request.symbol} • {tf_label(request.timeframe)}{range_part} • {source} Spot",
                              ylabel="Price (USDT)", ylabel_lower="Volume",
@@ -2877,10 +2916,11 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
             shift=display[-1]-ceiling; display=[y-shift for y in display]
             for i in range(len(display)-2,-1,-1): display[i]=min(display[i],display[i+1]-gap)
         ax.set_ylim(min(floor,display[0]-gap if display else floor),max(ceiling,display[-1]+gap if display else ceiling))
-        label_x=len(view)+13; anchor_x=len(view)-1
-        ax.set_xlim(-2,len(view)+18)
+        right=max(6,round(len(view)*0.12))          # label column stays ~12% of the width whether 30 or 500 candles are drawn
+        label_x=len(view)+round(right*0.72); anchor_x=len(view)-1
+        ax.set_xlim(-2,len(view)+right)
         # Keep volume panel horizontally aligned with the price panel.
-        for candidate in axes[1:]: candidate.set_xlim(-2,len(view)+18)
+        for candidate in axes[1:]: candidate.set_xlim(-2,len(view)+right)
         for item,ytext in zip(ordered,display):
             ax.annotate(item["text"],xy=(anchor_x,item["actual"]),xytext=(label_x,ytext),textcoords="data",
                         ha="right",va="center",fontsize=8,color=item["color"],clip_on=False,
@@ -3027,7 +3067,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text("আপনার account এখনো অনুমোদিত নয়। Package, মূল্য ও সুবিধা দেখতে নিচের option ব্যবহার করুন।",reply_markup=subscription_keyboard()); return
     common=("কীভাবে ব্যবহার করবেন\n\nযেভাবে খুশি লিখুন (ভুল বানানও চলবে) — না বুঝলে আমি জিজ্ঞেস করব। যেমন:\n"
             "• BTC 4h • bitkoin er dam koto • ইথেরিয়ামের ১ মাসের ক্যান্ডেল • SOL 1 week\n• BTC 70000 ছুঁলে জানাও • আজকের মার্কেট কেমন\n"
-            "/chart BTC 1 month — ১ সপ্তাহ/১ মাস/৩ মাসের chart\n/level BTC 70000 — price alert, /levels — তালিকা\n"
+            "/chart BTC 1 month — প্রতিটি candle ১ মাসের (১ সপ্তাহ/১ মাস/৩ মাস বেছে নিতে পারবেন)\n/level BTC 70000 — price alert, /levels — তালিকা\n"
             "/calc — futures position/liquidation হিসাব\n/buy, /sell, /portfolio — হোল্ডিং ও PnL\n/scorecard — signal কতটা কাজ করেছে\n/market — market summary\n/referral — বন্ধু আনলে বোনাস\n"
             "/history SUI 4h — আগের breakout events\n/risk 65000 63000 1000 1 — position size\n"
             "/alert SUI 4h confirmed — smart alert\n/alerts — active alerts\n/watchlist SUI — watchlist\n"
@@ -3091,7 +3131,7 @@ def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
 
 
 def tradingview_interval(timeframe: str) -> str:
-    return {"1m":"1","3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","2h":"120","4h":"240","6h":"360","8h":"480","12h":"720","1d":"D","3d":"3D","1w":"W","1mo":"M"}.get(timeframe,"240")
+    return {"1m":"1","3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","2h":"120","4h":"240","6h":"360","8h":"480","12h":"720","1d":"D","3d":"3D","1w":"W","1mo":"M","3mo":"3M"}.get(timeframe,"240")
 
 
 def tradingview_url(symbol: str,timeframe: str) -> str:
@@ -3134,9 +3174,9 @@ def analysis_keyboard(symbol: str, timeframe: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("1D", callback_data=f"an|{base}|1d")],
         [InlineKeyboardButton("📈 TradingView",url=tradingview_url(symbol,timeframe)),
          InlineKeyboardButton("📋 Script",callback_data=f"pine|{base}|{timeframe}")],
-        [InlineKeyboardButton("📅 1 সপ্তাহ", callback_data=f"rg|{base}|7"),
-         InlineKeyboardButton("📅 1 মাস", callback_data=f"rg|{base}|30"),
-         InlineKeyboardButton("📅 3 মাস", callback_data=f"rg|{base}|90")],
+        [InlineKeyboardButton("🕯 1 সপ্তাহ", callback_data=f"an|{base}|1w"),
+         InlineKeyboardButton("🕯 1 মাস", callback_data=f"an|{base}|1mo"),
+         InlineKeyboardButton("🕯 3 মাস", callback_data=f"an|{base}|3mo")],
         [InlineKeyboardButton("Set Alert", callback_data=f"al|{base}|{timeframe}"),
          InlineKeyboardButton("History", callback_data=f"hi|{base}|{timeframe}"),
          InlineKeyboardButton("Trade Plan", callback_data=f"plan|{base}|{timeframe}")],
@@ -4629,8 +4669,8 @@ async def send_price(update: Update, symbol: str, lang: str) -> None:
     if change is not None: lines.append(f"24h: {float(change):+.2f}%")
     if live.get("high") and live.get("low"): lines.append(f"24h High/Low: {float(live['high']):.8g} / {float(live['low']):.8g}")
     base = symbol.split("/")[0]
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📊 4H", callback_data=f"an|{base}|4h"), InlineKeyboardButton("📅 1W", callback_data=f"rg|{base}|7"),
-                                InlineKeyboardButton("📅 1M", callback_data=f"rg|{base}|30")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📊 4H", callback_data=f"an|{base}|4h"), InlineKeyboardButton("🕯 1 সপ্তাহ", callback_data=f"an|{base}|1w"),
+                                InlineKeyboardButton("🕯 1 মাস", callback_data=f"an|{base}|1mo")]])
     await update.effective_message.reply_text("\n".join(lines), reply_markup=kb)
 
 
@@ -4681,7 +4721,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/chart BTC 1 month — same as typing it, kept as a command for people who like commands."""
     if not context.args:
-        await update.effective_message.reply_text("ব্যবহার: /chart BTC 1 month\n/chart ETH 1 week\n/chart SOL 4h 3 month"); return
+        await update.effective_message.reply_text("ব্যবহার: /chart BTC 1 month (প্রতিটি candle ১ মাসের)\n/chart ETH 1 week (প্রতিটি candle ১ সপ্তাহের)\n/chart SOL 3 month (প্রতিটি candle ৩ মাসের)\n/chart BTC last 30 days (গত ৩০ দিনের পরিসর)"); return
     try: await handle_free_text(update, context, " ".join(context.args))
     except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}")
 
@@ -4930,7 +4970,7 @@ def live_signal_events(rows: list[Any], timeframe: str) -> list[dict[str, Any]]:
         payload = r["payload"] if isinstance(r["payload"], dict) else json.loads(r["payload"] or "{}")
         stamp = payload.get("last_closed_time")
         if stamp: opened = pd.Timestamp(stamp)
-        elif span and timeframe not in {"1w", "1mo", "3d"}:
+        elif span and timeframe not in {"1w", "1mo", "3mo", "3d"}:
             ts = int(r["created_at"].timestamp()); opened = pd.Timestamp((ts // span) * span - span, unit="s", tz="UTC")
         else: continue
         bo = payload.get("breakout") or {}
@@ -4983,56 +5023,86 @@ async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ---------------------------------------------------------------- market summary / auto reports
-async def build_market_report(lang: str = "bn", weekly: bool = False) -> str:
-    assert BOT is not None
-    async def tick(sym: str) -> dict[str, Any]: return await BOT.fetch_live_price(sym)
-    btc, eth, sent, flt = await asyncio.gather(tick("BTC/USDT"), tick("ETH/USDT"), BOT.market_sentiment(), BOT.market_filter("4h"))
-    now = datetime.now(ZoneInfo("Asia/Dhaka"))
-    lines = [tr(lang, f"📰 {'সাপ্তাহিক' if weekly else 'দৈনিক'} Market Report — {now:%d %b %Y}", f"📰 {'Weekly' if weekly else 'Daily'} Market Report — {now:%d %b %Y}")]
-    for name, t in (("BTC", btc), ("ETH", eth)):
-        if t.get("price"):
-            ch = t.get("change_pct"); lines.append(f"{name}: {t['price']:.8g} USDT" + (f" ({float(ch):+.2f}% 24h)" if ch is not None else ""))
-    if flt:
-        lines.append(tr(lang, f"4H trend: BTC {flt['btc']['structure']}, ETH {flt['eth']['structure']} — {'risk-on' if flt['risk_on'] else 'সতর্ক/risk-off'}",
-                        f"4H trend: BTC {flt['btc']['structure']}, ETH {flt['eth']['structure']} — {'risk-on' if flt['risk_on'] else 'cautious/risk-off'}"))
-    block = sentiment_text(sent.get("fear_greed"), sent.get("global"), lang)
-    if block: lines += ["", block]
-    if BOT.db:
-        days = 7 if weekly else 1
-        events = await BOT.db.fetch("SELECT symbol,timeframe,event_type FROM breakout_events WHERE created_at > NOW()-make_interval(days => $1) AND event_type IN ('BREAKOUT_CONFIRMED','BREAKDOWN_CONFIRMED') ORDER BY created_at DESC LIMIT 200", days)
-        if events:
-            up = sum(1 for e in events if e["event_type"] == "BREAKOUT_CONFIRMED"); down = len(events) - up
-            names = ", ".join(f"{e['symbol'].split('/')[0]} {e['timeframe']}" for e in events[:6])
-            lines += ["", tr(lang, f"গত {'৭ দিনে' if weekly else '২৪ ঘণ্টায়'} আমাদের monitor-এ confirmed: {up}টি breakout, {down}টি breakdown", f"Confirmed in our monitors over the last {'7 days' if weekly else '24h'}: {up} breakouts, {down} breakdowns"), f"সাম্প্রতিক: {names}"]
-    lines += ["", tr(lang, "শিক্ষামূলক তথ্য — আর্থিক পরামর্শ নয়।", "Educational information — not financial advice.")]
+def trend_mark(change: float | None, arrows: bool = True) -> str:
+    """🟢▲ up, 🔴▼ down, ⚪▬ flat (within ±0.5%)."""
+    if change is None: return "⚪"
+    if change >= 0.5: return "🟢 ▲" if arrows else "🟢"
+    if change <= -0.5: return "🔴 ▼" if arrows else "🔴"
+    return "⚪ ▬" if arrows else "⚪"
+
+
+def pretty_price(x: float) -> str:
+    return f"{x:,.0f}" if x >= 1000 else f"{x:,.2f}" if x >= 1 else f"{x:.6g}"
+
+
+def signed_pct(x: float) -> str:
+    return f"{'−' if x < 0 else '+'}{abs(x):.2f}%"
+
+
+def fear_greed_mark(value: int) -> str:
+    return "😱" if value <= 24 else "😨" if value <= 44 else "😐" if value <= 55 else "😀" if value <= 74 else "🤑"
+
+
+def bangla_clock(moment: datetime) -> str:
+    h = moment.hour
+    period = "রাত" if h < 4 else "ভোর" if h < 6 else "সকাল" if h < 12 else "দুপুর" if h < 15 else "বিকাল" if h < 17 else "সন্ধ্যা" if h < 19 else "রাত"
+    digits = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+    return f"{period} {(h % 12 or 12)}:{moment.minute:02d}".translate(digits)
+
+
+def market_report_text(now: datetime, coins: list[tuple[str, dict[str, Any]]], sent: dict[str, Any], lang: str = "bn", title: str | None = None) -> str:
+    """The channel report / /market message. A missing data source is shown as unavailable instead of silently disappearing."""
+    unavailable = tr(lang, "এখন পাওয়া যায়নি", "unavailable right now")
+    clock = bangla_clock(now) if lang == "bn" else now.strftime("%I:%M %p")
+    lines = [title or tr(lang, "📰 দৈনিক Market Report", "📰 Daily Market Report"), f"📅 {now:%d %b %Y} • {clock} ({tr(lang, 'ঢাকা', 'Dhaka')})", ""]
+    for name, tick in coins:
+        if tick.get("price"):
+            ch = tick.get("change_pct"); ch = None if ch is None else float(ch)
+            lines.append(f"{trend_mark(ch)} {name}  {pretty_price(float(tick['price']))}" + (f"  ({signed_pct(ch)})" if ch is not None else ""))
+        else:
+            lines.append(f"⚪ {name}  {unavailable}")
+    glob, fg = sent.get("global"), sent.get("fear_greed")
+    lines.append("")
+    lines.append(f"₿ BTC Dominance: {glob['btc_dominance']:.2f}%" if glob else f"₿ BTC Dominance: {unavailable}")
+    lines.append(f"{trend_mark(glob['market_cap_change_24h_pct'], arrows=False)} Total Market Cap 24h: {signed_pct(glob['market_cap_change_24h_pct'])}" if glob else f"⚪ Total Market Cap 24h: {unavailable}")
+    lines.append(f"{fear_greed_mark(fg['value'])} Fear & Greed: {fg['value']} ({fg['label']})" if fg else f"😐 Fear & Greed: {unavailable}")
     return "\n".join(lines)
+
+
+async def build_market_report(lang: str = "bn", title: str | None = None) -> str:
+    assert BOT is not None
+    btc, eth, sent = await asyncio.gather(BOT.fetch_live_price("BTC/USDT"), BOT.fetch_live_price("ETH/USDT"), BOT.market_sentiment())
+    if not btc.get("price") and not eth.get("price"):
+        raise RuntimeError("market report: no price data from any exchange")
+    return market_report_text(datetime.now(ZoneInfo("Asia/Dhaka")), [("BTC", btc), ("ETH", eth)], sent, lang, title)
 
 
 async def market_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     lang = await user_lang(update)
     status = await update.effective_message.reply_text(tr(lang, "⏳ Market summary তৈরি হচ্ছে…", "⏳ Building market summary…"))
-    try: await send_long(update.effective_message, await build_market_report(lang))
+    try:
+        await update.effective_message.reply_text(await build_market_report(lang, tr(lang, "📰 Market Summary", "📰 Market Summary")))
+    except RuntimeError:
+        await update.effective_message.reply_text(tr(lang, "⚠️ এখন দাম পাওয়া যাচ্ছে না, একটু পরে চেষ্টা করুন।", "⚠️ Prices are unavailable right now, try again shortly."))
     finally:
         try: await status.delete()
         except BadRequest: pass
 
 
 async def report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Post the daily (and Monday weekly) report to the channel once per day, retrying through the day if Telegram fails."""
+    """Post the daily report to the channel once every day at DAILY_REPORT_HOUR (Dhaka); retried through the day if Telegram/data fails."""
     assert BOT is not None
     if not REPORT_CHANNEL_ID or not BOT.db: return
     now = datetime.now(ZoneInfo("Asia/Dhaka"))
     if now.hour < DAILY_REPORT_HOUR: return
-    kinds = ["daily"] + (["weekly"] if now.weekday() == 0 else [])
-    for kind in kinds:
-        claimed = await BOT.db.fetchval("INSERT INTO report_log(kind,sent_on) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING kind", kind, now.date())
-        if claimed is None: continue
-        try:
-            await context.bot.send_message(REPORT_CHANNEL_ID, await build_market_report("bn", weekly=(kind == "weekly")))
-        except Exception:
-            await BOT.db.execute("DELETE FROM report_log WHERE kind=$1 AND sent_on=$2", kind, now.date())   # let the next pass retry
-            raise
+    claimed = await BOT.db.fetchval("INSERT INTO report_log(kind,sent_on) VALUES('daily',$1) ON CONFLICT DO NOTHING RETURNING kind", now.date())
+    if claimed is None: return
+    try:
+        await context.bot.send_message(REPORT_CHANNEL_ID, await build_market_report("bn"))
+    except Exception:
+        await BOT.db.execute("DELETE FROM report_log WHERE kind='daily' AND sent_on=$1", now.date())   # let the next pass retry
+        raise
 
 
 async def retention_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5147,7 +5217,7 @@ async def post_init(application: Application) -> None:
         jq.run_repeating(guarded_job(trade_job), interval=60, first=35, name="paper-trade-monitor")
         jq.run_repeating(guarded_job(channel_price_job), interval=60, first=45, name="channel-price-cards")
         jq.run_repeating(guarded_job(subscription_expiry_job), interval=3600, first=60, name="subscription-expiry")
-        jq.run_repeating(guarded_job(report_job), interval=900, first=90, name="auto-report")
+        jq.run_repeating(guarded_job(report_job), interval=300, first=90, name="auto-report")
         jq.run_repeating(guarded_job(retention_job), interval=21600, first=300, name="analyses-retention")
 
 async def post_shutdown(application: Application) -> None:
