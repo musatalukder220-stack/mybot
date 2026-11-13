@@ -100,7 +100,7 @@ try:
     import pandas as pd
     from PIL import Image, ImageDraw, ImageFont
     from dotenv import load_dotenv
-    from telegram import BotCommand, BotCommandScopeChat, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Message, Update
+    from telegram import BotCommand, BotCommandScopeChat, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, MenuButtonCommands, Message, Update
     from telegram.constants import ChatAction, ParseMode
     from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
     from telegram.ext import (Application, ApplicationBuilder, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes,
@@ -3677,6 +3677,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             o=store["opts"][int(parts[2])]; context.user_data.pop("pending",None)
             chosen=NLUResult(intent=o["intent"],symbol=o.get("symbol"),timeframe=o.get("timeframe"),range_days=o.get("range_days"),price=o.get("price"),direction=o.get("direction"),confidence=1.0)
             await dispatch_understood(update,context,chosen,store.get("text",""),await user_lang(update)); return
+        if parts[0]=="pf" and len(parts)>=2:
+            await portfolio_callback(update,context,parts); return
         if parts[0]=="lvdel" and len(parts)==2 and parts[1].isdigit():
             done=await BOT.db.execute("UPDATE price_level_alerts SET active=FALSE WHERE id=$1 AND telegram_id=$2 AND active",int(parts[1]),update.effective_user.id)
             await q.message.reply_text("🗑 Alert মুছে ফেলা হয়েছে।" if done.endswith("1") else "এই alert আগেই বন্ধ হয়েছে।"); return
@@ -4637,6 +4639,12 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     text = (text or "").strip()
     if not text or len(text) > 500:
         await msg.reply_text(tr(lang, "১–৫০০ অক্ষরের মধ্যে লিখুন — যেমন BTC 4h অথবা ইথেরিয়ামের ১ মাসের chart।", "Please write 1-500 characters, e.g. BTC 4h or ETH 1 month chart.")); return
+    trade = context.user_data.get("pf_pending")
+    if trade and time.time() - trade.get("at", 0) > PENDING_TTL: context.user_data.pop("pf_pending", None); trade = None
+    if trade:
+        context.user_data.pop("pf_pending", None)
+        if normalize(text).strip().lower() in CANCEL_WORDS: await msg.reply_text("বাতিল করা হয়েছে।"); return
+        await finish_trade(update, context, trade["side"], text); return
     known = BOT.known_bases()
     pending = context.user_data.get("pending")
     if pending and time.time() - pending.get("at", 0) > PENDING_TTL:
@@ -4892,62 +4900,373 @@ async def calc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------- portfolio / PnL
-async def portfolio_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str) -> None:
-    assert BOT is not None
-    cmd = "buy" if side == "buy" else "sell"
-    if not BOT.db: await update.effective_message.reply_text("Portfolio-র জন্য DATABASE_URL প্রয়োজন।"); return
-    if len(context.args) < 2:
-        await update.effective_message.reply_text(f"ব্যবহার: /{cmd} BTC 0.01 65000\n(দাম না দিলে এখনকার দাম ধরা হবে)"); return
-    try:
-        symbol = BOT._normalize_symbol(context.args[0])
-        qty = to_number(normalize(context.args[1])); price = to_number(normalize(context.args[2])) if len(context.args) > 2 else None
-        if not qty or qty <= 0: raise UserInputError("পরিমাণ (quantity) ধনাত্মক সংখ্যা হতে হবে।")
-        if price is None:
-            live = await BOT.fetch_live_price(symbol)
-            if not live.get("price"): raise UserInputError("এখনকার দাম পাওয়া যায়নি; দাম নিজে লিখুন।")
-            price = float(live["price"])
-        await BOT.ensure_user(update); uid = update.effective_user.id
-        async with BOT.db.acquire() as con:
-            async with con.transaction():
-                row = await con.fetchrow("SELECT qty,avg_price,realized FROM portfolio_positions WHERE telegram_id=$1 AND symbol=$2 FOR UPDATE", uid, symbol)
-                q0, a0, r0 = (float(row["qty"]), float(row["avg_price"]), float(row["realized"])) if row else (0.0, 0.0, 0.0)
-                if side == "buy":
-                    nq, na = portfolio_buy(q0, a0, qty, price); nr = r0; note = f"নতুন গড় দাম: {na:.8g}"
-                else:
-                    if not row or q0 <= 0: raise UserInputError(f"আপনার portfolio-তে {symbol.split('/')[0]} নেই।")
-                    try: nq, na, nr, pnl = portfolio_sell(q0, a0, r0, qty, price)
-                    except ValueError as exc: raise UserInputError(f"আপনার কাছে আছে {q0:.8g}, এর বেশি বিক্রি করা যাবে না।") from exc
-                    note = f"এই বিক্রির লাভ/ক্ষতি: {pnl:+.2f} USDT"
-                await con.execute("""INSERT INTO portfolio_positions(telegram_id,symbol,qty,avg_price,realized,updated_at) VALUES($1,$2,$3,$4,$5,NOW())
-                    ON CONFLICT(telegram_id,symbol) DO UPDATE SET qty=EXCLUDED.qty,avg_price=EXCLUDED.avg_price,realized=EXCLUDED.realized,updated_at=NOW()""", uid, symbol, nq, na, nr)
-        await update.effective_message.reply_text(f"✅ {'Buy' if side == 'buy' else 'Sell'} {qty:.8g} {symbol.split('/')[0]} @ {price:.8g}\n{note}\nএখন হোল্ডিং: {nq:.8g}\n/portfolio দিয়ে সব দেখুন।")
-    except UserInputError as exc:
-        await update.effective_message.reply_text(f"⚠️ {exc}")
+# ---------------------------------------------------------------- portfolio screen
+# One photo message per person. Page changes and the 30-second refresh EDIT that same message; nothing is re-sent.
+PF_PAGE_SIZE = 4
+PF_REFRESH_SECONDS = _env_int("PORTFOLIO_REFRESH_SECONDS", 30, 10, 300)
+PF_LIVE_MINUTES = _env_int("PORTFOLIO_LIVE_MINUTES", 30, 1, 720)
+PF_VIEWS: dict[int, dict[str, Any]] = {}          # telegram_id -> {chat_id, message_id, page, expires}
+
+COIN_NAMES = {"BTC": "Bitcoin", "ETH": "Ethereum", "USDT": "TetherUS", "BNB": "BNB", "SOL": "Solana", "XRP": "XRP", "ADA": "Cardano", "DOGE": "Dogecoin",
+              "TRX": "TRON", "LTC": "Litecoin", "SUI": "Sui", "SEI": "Sei", "LINK": "Chainlink", "AVAX": "Avalanche", "DOT": "Polkadot", "MATIC": "Polygon",
+              "POL": "Polygon Ecosystem Token", "SHIB": "Shiba Inu", "PEPE": "Pepe", "TON": "Toncoin", "NEAR": "NEAR Protocol", "ATOM": "Cosmos", "UNI": "Uniswap",
+              "BCH": "Bitcoin Cash", "ETC": "Ethereum Classic", "XLM": "Stellar", "FIL": "Filecoin", "APT": "Aptos", "ARB": "Arbitrum", "OP": "Optimism",
+              "INJ": "Injective", "AAVE": "Aave", "ICP": "Internet Computer", "HBAR": "Hedera", "ALGO": "Algorand", "SAND": "The Sandbox", "FLOW": "Flow",
+              "NOT": "Notcoin", "WLD": "Worldcoin", "TIA": "Celestia", "RUNE": "THORChain", "FET": "Artificial Superintelligence Alliance"}
+COIN_COLORS = {"BTC": (247, 147, 26), "ETH": (98, 126, 234), "USDT": (38, 161, 123), "LTC": (255, 255, 255), "SUI": (77, 162, 255), "BNB": (243, 186, 47),
+               "SOL": (153, 69, 255), "XRP": (35, 41, 47), "DOGE": (194, 166, 51), "TRX": (235, 0, 41), "ADA": (0, 51, 173)}
+
+PF_BG, PF_CARD, PF_LINE = (30, 35, 41), (38, 44, 53), (52, 59, 70)
+PF_WHITE, PF_GRAY, PF_SOFT = (255, 255, 255), (132, 142, 156), (201, 207, 214)
+PF_RED, PF_GREEN = (246, 70, 93), (14, 203, 129)
 
 
-async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: await portfolio_trade(update, context, "buy")
-async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: await portfolio_trade(update, context, "sell")
+def trim_money(x: float) -> str:
+    """Two decimals with trailing zeros dropped (-3.20 -> -3.2), like the reference screen."""
+    text = f"{abs(x):,.2f}".rstrip("0").rstrip(".")
+    return ("-" if x < 0 and text not in ("0", "") else "") + (text or "0")
+
+
+def plain_amount(qty: float) -> str:
+    text = f"{qty:.8f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def build_portfolio_view(rows: list[dict[str, Any]], prices: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Pure numbers for the screen. rows: portfolio_positions rows; prices: symbol -> live ticker dict."""
+    items: list[dict[str, Any]] = []; total = day = realized = 0.0; missing: list[str] = []
+    for r in rows:
+        realized += float(r.get("realized") or 0)
+        qty = float(r["qty"])
+        if qty <= 0: continue
+        base = str(r["symbol"]).split("/")[0]; avg = float(r["avg_price"])
+        if base == "USDT":
+            items.append({"base": base, "name": COIN_NAMES["USDT"], "qty": qty, "value": qty, "cash": True, "pnl": None, "pnl_pct": None}); total += qty
+            continue
+        tick = prices.get(r["symbol"]) or {}; price = float(tick.get("price") or 0); live = price > 0
+        if not live: missing.append(base); price = avg          # show cost so the total is not understated
+        value = qty * price; cost = qty * avg; pnl = value - cost
+        items.append({"base": base, "name": COIN_NAMES.get(base, base), "qty": qty, "value": value, "cash": False, "pnl": pnl,
+                      "pnl_pct": (pnl / cost * 100) if cost > 0 else 0.0, "price": price})
+        total += value
+        change = tick.get("change_pct")
+        if live and change is not None and float(change) > -99.9: day += value - value / (1 + float(change) / 100)
+    items.sort(key=lambda x: x["value"], reverse=True)
+    base_value = total - day
+    return {"items": items, "total": total, "day_pnl": day, "day_pct": (day / base_value * 100) if base_value > 0 else 0.0, "realized": realized, "missing": missing}
+
+
+def portfolio_pages(view: dict[str, Any], page_size: int = PF_PAGE_SIZE) -> int:
+    return max(1, math.ceil(len(view["items"]) / page_size))
+
+
+def portfolio_keyboard(page: int, pages: int) -> InlineKeyboardMarkup:
+    """One page: [Buy | Sell]. Several pages: [Buy | Next] / [Previous] / [Sell]; the last page shows Previous beside Buy."""
+    buy = InlineKeyboardButton("🟢 Buy", callback_data="pf|buy")
+    sell = InlineKeyboardButton("🔴 Sell", callback_data="pf|sell")
+    if pages <= 1: return InlineKeyboardMarkup([[buy, sell]])
+    nxt = InlineKeyboardButton("Next ▶", callback_data=f"pf|p|{page + 1}")
+    prev = InlineKeyboardButton("◀ Previous", callback_data=f"pf|p|{page - 1}")
+    rows = [[buy, nxt if page < pages - 1 else prev]]
+    if 0 < page < pages - 1: rows.append([prev])
+    rows.append([sell])
+    return InlineKeyboardMarkup(rows)
+
+
+def portfolio_caption(view: dict[str, Any], page: int, pages: int, now: datetime | None = None) -> str:
+    now = now or datetime.now(ZoneInfo("Asia/Dhaka"))
+    lines = [f"🕒 {now:%H:%M:%S} (ঢাকা) • প্রতি {PF_REFRESH_SECONDS} সেকেন্ডে আপডেট"]
+    if pages > 1: lines[0] += f" • পাতা {page + 1}/{pages}"
+    lines.append(f"Realized PnL: {view['realized']:+.2f} USDT • Today's PNL = গত ২৪ ঘণ্টার দামের পরিবর্তন")
+    lines.append("আপনার নিজের দেওয়া তথ্য থেকে হিসাব — exchange wallet নয়।")
+    if view["missing"]: lines.append("⚠️ দাম পাওয়া যায়নি (কেনা দামে ধরা): " + ", ".join(view["missing"]))
+    return "\n".join(lines)
+
+
+_PF_FONTS: dict[tuple[int, bool], Any] = {}
+
+
+def _pf_font(size: int, bold: bool = False) -> Any:
+    key = (size, bold)
+    if key not in _PF_FONTS: _PF_FONTS[key] = _card_font(size, bold)
+    return _PF_FONTS[key]
+
+
+def render_portfolio_image(view: dict[str, Any], page: int, logos: dict[str, bytes | None] | None = None, page_size: int = PF_PAGE_SIZE) -> bytes:
+    """Draw the wallet-style Spot screen (without the Add Funds / Send / Transfer buttons) as a PNG. Drawn at 2x and scaled down for smooth edges."""
+    logos = logos or {}
+    S, W = 2, 1096
+    items = view["items"][page * page_size:(page + 1) * page_size]
+    ROW_PNL, ROW_CASH, HEADER = 276, 203, 115
+    card_top = 730
+    card_h = HEADER + sum(ROW_CASH if i["cash"] else ROW_PNL for i in items) + 36
+    H = card_top + card_h + 44
+    im = Image.new("RGB", (W * S, H * S), PF_BG); d = ImageDraw.Draw(im)
+
+    def px(v: float) -> int: return int(round(v * S))
+    def text(x: float, y: float, t: str, size: int, fill: Any, bold: bool = False, anchor: str = "lm") -> float:
+        f = _pf_font(size * S, bold); d.text((px(x), px(y)), t, font=f, fill=fill, anchor=anchor)
+        return d.textlength(t, font=f) / S
+    def line(x0: float, y0: float, x1: float, y1: float, fill: Any, w: float = 2) -> None: d.line([px(x0), px(y0), px(x1), px(y1)], fill=fill, width=px(w))
+    def rrect(box: tuple[float, float, float, float], r: float, fill: Any = None, outline: Any = None, w: float = 3) -> None:
+        d.rounded_rectangle([px(box[0]), px(box[1]), px(box[2]), px(box[3])], radius=px(r), fill=fill, outline=outline, width=px(w))
+    def ring(cx: float, cy: float, r: float, outline: Any, w: float = 4, fill: Any = None) -> None:
+        d.ellipse([px(cx - r), px(cy - r), px(cx + r), px(cy + r)], outline=outline, fill=fill, width=px(w))
+
+    # top tabs
+    x = 48
+    for i, (name, active) in enumerate((("Overview", False), ("Spot", True), ("Funding", False), ("Futures", False), ("Earn", False))):
+        x += text(x, 68, name, 44, PF_WHITE if active else PF_GRAY, bold=active) + 46
+    line(0, 135, W, 135, PF_LINE, 2)
+    rrect((48, 175, 188, 263), 14, fill=(44, 50, 61))
+    text(118, 219, "Spot", 38, PF_WHITE, True, "mm")
+    text(240, 219, "Cross Margin", 38, PF_GRAY); text(585, 219, "Isolated Margin", 38, PF_GRAY)
+
+    # totals
+    w = text(52, 347, "Est. Total Value", 38, PF_SOFT)
+    ring(52 + w + 44, 347, 20, PF_GRAY, 4, None); ring(52 + w + 44, 347, 7, PF_GRAY, 4)
+    rrect((988, 318, 1036, 376), 10, outline=PF_GRAY, w=4); ring(1030, 366, 14, PF_GRAY, 4, PF_BG); line(1030, 358, 1030, 366, PF_GRAY, 4); line(1030, 366, 1036, 370, PF_GRAY, 4)
+    total_text = f"{view['total']:,.2f}"
+    w = text(52, 458, total_text, 96, PF_WHITE, True)
+    w2 = text(52 + w + 20, 470, "USDT", 38, PF_WHITE, True)
+    d.polygon([(px(52 + w + 20 + w2 + 22), px(458)), (px(52 + w + 20 + w2 + 46), px(458)), (px(52 + w + 20 + w2 + 34), px(472))], fill=PF_WHITE)
+    text(52, 560, f"≈ ${total_text}", 38, PF_GRAY)
+    w = text(52, 645, "Today's PNL", 38, PF_SOFT)
+    for dx in range(52, 52 + int(w), 12): line(dx, 688, dx + 6, 688, PF_GRAY, 2)
+    day = view["day_pnl"]; colour = PF_GREEN if day >= 0 else PF_RED
+    sign = "+" if day >= 0 else "-"
+    w2 = text(52 + w + 18, 645, f"{sign}{trim_money(abs(day))} USDT({sign}{abs(view['day_pct']):.2f}%)", 38, colour)
+    cx = 52 + w + 18 + w2 + 34
+    line(cx, 630, cx + 12, 645, PF_GRAY, 4); line(cx + 12, 645, cx, 660, PF_GRAY, 4)
+
+    # balance card
+    rrect((52, card_top, 1044, card_top + card_h), 40, fill=PF_CARD)
+    text(90, card_top + 58, "Balance", 44, PF_GRAY)
+    ring(882, card_top + 58, 24, PF_GRAY, 4); ring(882, card_top + 58, 10, PF_GRAY, 4)
+    for dy in (-12, 0, 12): line(962, card_top + 58 + dy, 1002, card_top + 58 + dy, PF_GRAY, 4)
+    line(52, card_top + HEADER, 1044, card_top + HEADER, PF_LINE, 2)
+    y = card_top + HEADER
+    for n, item in enumerate(items):
+        height = ROW_CASH if item["cash"] else ROW_PNL
+        cy = y + 103
+        logo = logos.get(item["base"])
+        done = False
+        if logo:
+            try:
+                pic = Image.open(io.BytesIO(logo)).convert("RGBA").resize((px(76), px(76)), Image.LANCZOS)
+                mask = Image.new("L", pic.size, 0); ImageDraw.Draw(mask).ellipse([0, 0, pic.size[0] - 1, pic.size[1] - 1], fill=255)
+                im.paste(pic, (px(88), px(cy - 38)), Image.composite(pic.getchannel("A"), Image.new("L", pic.size, 0), mask)); done = True
+            except Exception:  # noqa: BLE001 - a broken logo must not break the screen
+                done = False
+        if not done:
+            fill = COIN_COLORS.get(item["base"]) or tuple(70 + (hash(item["base"]) >> s) % 150 for s in (0, 8, 16))
+            ring(126, cy, 38, fill, 1, fill)
+            dark = sum(fill) > 600
+            text(126, cy, "₮" if item["base"] == "USDT" else item["base"][:3], 22 if len(item["base"]) > 2 else 28, (40, 40, 40) if dark else PF_WHITE, True, "mm")
+        text(190, y + 77, item["base"], 40, PF_WHITE, True)
+        text(1006, y + 77, plain_amount(item["qty"]), 42, PF_WHITE, True, "rm")
+        text(190, y + 143, item["name"], 34, PF_GRAY)
+        if not item["cash"]:
+            text(1006, y + 143, f"{item['value']:,.2f} USDT", 34, PF_GRAY, False, "rm")
+            text(190, y + 212, "Unrealized PNL", 34, PF_GRAY)
+            colour = PF_GREEN if item["pnl"] >= 0 else PF_RED
+            plus = "+" if item["pnl"] >= 0 else ""
+            text(1006, y + 212, f"{plus}{trim_money(item['pnl'])} USDT({plus}{item['pnl_pct']:.2f}%)", 34, colour, False, "rm")
+        y += height
+        if n < len(items) - 1: line(88, y, 1008, y, PF_LINE, 2)
+    out = im.resize((W, H), Image.LANCZOS)
+    buf = io.BytesIO(); out.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+async def portfolio_render(uid: int, page: int) -> tuple[bytes, str, InlineKeyboardMarkup, int] | None:
+    """Current screen for this person, or None when the portfolio is empty."""
+    assert BOT is not None and BOT.db is not None
+    rows = [dict(r) for r in await BOT.db.fetch("SELECT symbol,qty,avg_price,realized FROM portfolio_positions WHERE telegram_id=$1", uid)]
+    held = [r for r in rows if float(r["qty"]) > 0 and not r["symbol"].startswith("USDT/")]
+    if not any(float(r["qty"]) > 0 for r in rows): return None
+    lives = await asyncio.gather(*(BOT.fetch_live_price(r["symbol"]) for r in held), return_exceptions=True)
+    view = build_portfolio_view(rows, {r["symbol"]: x for r, x in zip(held, lives) if isinstance(x, dict)})
+    pages = portfolio_pages(view); page = min(max(page, 0), pages - 1)
+    shown = view["items"][page * PF_PAGE_SIZE:(page + 1) * PF_PAGE_SIZE]
+
+    async def logo(base: str) -> bytes | None:
+        try: return await asyncio.wait_for(fetch_coin_logo(f"{base}/USDT"), 4)
+        except Exception: return None          # the coloured letter badge is used instead
+    pictures = await asyncio.gather(*(logo(i["base"]) for i in shown))
+    image = await asyncio.to_thread(render_portfolio_image, view, page, dict(zip((i["base"] for i in shown), pictures)))
+    return image, portfolio_caption(view, page, pages), portfolio_keyboard(page, pages), page
+
+
+async def portfolio_push(bot: Any, uid: int, view: dict[str, Any], page: int | None = None) -> None:
+    """Edit the person's existing portfolio message in place."""
+    rendered = await portfolio_render(uid, view["page"] if page is None else page)
+    if rendered is None:
+        PF_VIEWS.pop(uid, None)
+        await bot.edit_message_caption(chat_id=view["chat_id"], message_id=view["message_id"], caption="Portfolio এখন খালি। /buy দিয়ে যোগ করুন।", reply_markup=None)
+        return
+    image, caption, keyboard, shown_page = rendered
+    view["page"] = shown_page
+    await bot.edit_message_media(chat_id=view["chat_id"], message_id=view["message_id"], media=InputMediaPhoto(media=image, caption=caption), reply_markup=keyboard)
+
+
+def forget_if_gone(uid: int, exc: BaseException) -> bool:
+    """True when Telegram says the message can no longer be edited (deleted etc.): stop refreshing it."""
+    text = str(exc).lower()
+    if "not modified" in text: return False
+    if any(x in text for x in ("not found", "can't be edited", "message to edit", "chat not found", "blocked")):
+        PF_VIEWS.pop(uid, None); return True
+    return False
+
+
+async def portfolio_refresh_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every PF_REFRESH_SECONDS: edit each open portfolio screen with fresh prices. Stops PF_LIVE_MINUTES after it was last used."""
+    now = time.time()
+    for uid, view in list(PF_VIEWS.items()):
+        if now > view["expires"]:
+            PF_VIEWS.pop(uid, None)
+            try:
+                await context.bot.edit_message_caption(chat_id=view["chat_id"], message_id=view["message_id"],
+                                                       caption="⏸ লাইভ আপডেট বন্ধ। আবার দেখতে /portfolio চাপুন বা নিচের বোতাম ব্যবহার করুন।", reply_markup=portfolio_keyboard(view["page"], 1))
+            except Exception: pass
+            continue
+        try:
+            await portfolio_push(context.bot, uid, view)
+        except RetryAfter as exc:
+            log.warning("Portfolio refresh throttled by Telegram: %s", exc)
+        except (BadRequest, NetworkError, TimedOut) as exc:
+            if not forget_if_gone(uid, exc): log.info("Portfolio refresh skipped for %s: %s", uid, exc)
+        except Exception:  # noqa: BLE001
+            log.exception("Portfolio refresh failed for %s", uid)
 
 
 async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context; assert BOT is not None
-    if not BOT.db: await update.effective_message.reply_text("Portfolio-র জন্য DATABASE_URL প্রয়োজন।"); return
-    rows = await BOT.db.fetch("SELECT symbol,qty,avg_price,realized FROM portfolio_positions WHERE telegram_id=$1", update.effective_user.id)
-    if not rows:
-        await update.effective_message.reply_text("Portfolio খালি। কিনলে লিখে রাখুন: /buy BTC 0.01 65000\nবিক্রি করলে: /sell BTC 0.005 70000"); return
-    held = [dict(r) for r in rows if float(r["qty"]) > 0]
-    prices: dict[str, float] = {}
-    lives = await asyncio.gather(*(BOT.fetch_live_price(r["symbol"]) for r in held))
-    for r, live in zip(held, lives):
-        if live.get("price"): prices[r["symbol"]] = float(live["price"])
-    s = portfolio_summary([dict(r) for r in rows], prices)
-    lines = ["💼 Portfolio (আপনার নিজের দেওয়া তথ্য থেকে — exchange wallet নয়)"]
-    for r in s["rows"]:
-        pnl = f" | {r['pnl']:+.2f} ({r['pnl_pct']:+.1f}%)" if "pnl" in r else " | দাম অনুপলব্ধ"
-        lines.append(f"{r['symbol'].split('/')[0]}: {r['qty']:.8g} @ {r['avg_price']:.8g}{pnl}")
-    lines += [f"\nInvested: {s['invested']:.2f} USDT | Value: {s['value']:.2f} USDT", f"Unrealized: {s['unrealized']:+.2f} | Realized: {s['realized']:+.2f}",
-              f"Total PnL: {s['total_pnl']:+.2f} USDT ({s['total_pnl_pct']:+.1f}% unrealized on cost)", "\nHolding মুছতে: /portfolio_remove BTC"]
-    await update.effective_message.reply_text("\n".join(lines))
+    msg = update.effective_message
+    if not BOT.db: await msg.reply_text("Portfolio-র জন্য DATABASE_URL প্রয়োজন।"); return
+    await BOT.ensure_user(update); uid = update.effective_user.id
+    rendered = await portfolio_render(uid, 0)
+    if rendered is None:
+        await msg.reply_text("💼 Portfolio খালি। কিনলে নিচের Buy চাপুন (বা লিখুন: /buy ETH 0.5 2000)।", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟢 Buy", callback_data="pf|buy")]])); return
+    image, caption, keyboard, _ = rendered
+    old = PF_VIEWS.pop(uid, None)
+    sent = await msg.reply_photo(photo=image, caption=caption, reply_markup=keyboard)
+    PF_VIEWS[uid] = {"chat_id": sent.chat_id if hasattr(sent, "chat_id") else update.effective_chat.id, "message_id": sent.message_id, "page": 0, "expires": time.time() + PF_LIVE_MINUTES * 60}
+    if old:      # one live screen per person: the previous one is removed instead of being left to go stale
+        try: await msg.get_bot().delete_message(old["chat_id"], old["message_id"])
+        except Exception: pass
+
+
+async def portfolio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]) -> None:
+    assert BOT is not None
+    q = update.callback_query; uid = update.effective_user.id
+    if parts[1] in {"buy", "sell"}:
+        context.user_data["pf_pending"] = {"side": parts[1], "at": time.time()}
+        if parts[1] == "buy":
+            await q.message.reply_text("🟢 কী কিনেছেন? লিখুন: coin, পরিমাণ, দাম\nউদাহরণ: ETH 0.5 2000\n(দাম না দিলে এখনকার দাম ধরব। নগদ USDT যোগ করতে: USDT 100)\nবাতিল করতে: cancel")
+        else:
+            await q.message.reply_text("🔴 কী বিক্রি করেছেন? লিখুন: coin, পরিমাণ, দাম\nউদাহরণ: ETH 0.2 2100\n(সব বিক্রি করলে: ETH all)\nবাতিল করতে: cancel")
+        return
+    if parts[1] == "p" and len(parts) == 3 and parts[2].lstrip("-").isdigit():
+        rendered = await portfolio_render(uid, int(parts[2]))
+        if rendered is None: await q.message.reply_text("Portfolio খালি।"); return
+        image, caption, keyboard, page = rendered
+        try:
+            await q.message.edit_media(media=InputMediaPhoto(media=image, caption=caption), reply_markup=keyboard)
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower(): raise
+        old = PF_VIEWS.get(uid)
+        if old and old["message_id"] != q.message.message_id: PF_VIEWS.pop(uid, None)
+        PF_VIEWS[uid] = {"chat_id": q.message.chat_id, "message_id": q.message.message_id, "page": page, "expires": time.time() + PF_LIVE_MINUTES * 60}
+
+
+# ---------------------------------------------------------------- portfolio trades (buy / sell)
+CANCEL_WORDS = {"cancel", "বাতিল", "batil", "stop"}
+ALL_WORDS = {"all", "sob", "সব", "সবটা", "full"}
+
+
+def parse_trade_text(text: str, known: set[str]) -> dict[str, Any]:
+    """'ETH 0.5 2000', 'bought 0.5 eth at 2000', 'USDT 100', 'eth all' -> {symbol, qty|None (all), price|None}. Raises ValueError with a helpful message."""
+    clean = normalize(text)
+    words = re.findall(r"[A-Za-z]+|\d[\d,]*\.?\d*|\.\d+|[^\s\w]|\w+", clean)
+    numbers = [float(w.replace(",", "")) for w in words if re.fullmatch(r"\d[\d,]*\.?\d*|\.\d+", w)]
+    wants_all = any(w.lower() in ALL_WORDS for w in words)
+    base = "USDT" if any(w.upper() == "USDT" for w in words) and not any(w.upper().endswith("USDT") and len(w) > 4 for w in words) else None
+    if base is None:
+        base = understand(clean, known).symbol
+    if not base:
+        raise ValueError("কোন coin তা বুঝতে পারিনি। coin-এর নাম দিন, যেমন: ETH 0.5 2000")
+    if base == "USDT":
+        qty = None if wants_all else (numbers[0] if numbers else None)
+        if qty is None and not wants_all: raise ValueError("কত USDT? উদাহরণ: USDT 100")
+        return {"symbol": "USDT/USDT", "qty": qty, "price": 1.0}
+    if wants_all: qty = None; price = numbers[0] if numbers else None
+    else:
+        if not numbers: raise ValueError("পরিমাণ লিখুন। উদাহরণ: ETH 0.5 2000")
+        qty = numbers[0]; price = numbers[1] if len(numbers) > 1 else None
+    if qty is not None and qty <= 0: raise ValueError("পরিমাণ শূন্যের চেয়ে বেশি হতে হবে।")
+    if price is not None and price <= 0: raise ValueError("দাম শূন্যের চেয়ে বেশি হতে হবে।")
+    return {"symbol": f"{base}/USDT", "qty": qty, "price": price}
+
+
+async def apply_portfolio_trade(uid: int, side: str, symbol: str, qty: float | None, price: float | None) -> str:
+    """Record a buy/sell atomically. qty None means 'everything I hold' (sell only)."""
+    assert BOT is not None and BOT.db is not None
+    base = symbol.split("/")[0]
+    if price is None:
+        live = await BOT.fetch_live_price(symbol)
+        if not live.get("price"): raise UserInputError("এখনকার দাম পাওয়া যায়নি; দাম নিজে লিখুন।")
+        price = float(live["price"])
+    async with BOT.db.acquire() as con:
+        async with con.transaction():
+            row = await con.fetchrow("SELECT qty,avg_price,realized FROM portfolio_positions WHERE telegram_id=$1 AND symbol=$2 FOR UPDATE", uid, symbol)
+            q0, a0, r0 = (float(row["qty"]), float(row["avg_price"]), float(row["realized"])) if row else (0.0, 0.0, 0.0)
+            if side == "buy":
+                if qty is None: raise UserInputError("কেনার পরিমাণ লিখুন।")
+                nq, na = portfolio_buy(q0, a0, qty, price); nr = r0; note = "" if base == "USDT" else f"নতুন গড় দাম: {na:.8g}"
+            else:
+                if q0 <= 0: raise UserInputError(f"আপনার portfolio-তে {base} নেই।")
+                sell_qty = q0 if qty is None else qty
+                try: nq, na, nr, pnl = portfolio_sell(q0, a0, r0, sell_qty, price)
+                except ValueError as exc: raise UserInputError(f"আপনার কাছে আছে {plain_amount(q0)}, এর বেশি বিক্রি করা যাবে না।") from exc
+                qty = sell_qty; note = "" if base == "USDT" else f"এই বিক্রির লাভ/ক্ষতি: {pnl:+.2f} USDT"
+            if base == "USDT": na = 1.0
+            await con.execute("""INSERT INTO portfolio_positions(telegram_id,symbol,qty,avg_price,realized,updated_at) VALUES($1,$2,$3,$4,$5,NOW())
+                ON CONFLICT(telegram_id,symbol) DO UPDATE SET qty=EXCLUDED.qty,avg_price=EXCLUDED.avg_price,realized=EXCLUDED.realized,updated_at=NOW()""", uid, symbol, nq, na, nr)
+    shown = f"{base} @ {price:.8g}" if base != "USDT" else "USDT"
+    return f"✅ {'Buy' if side == 'buy' else 'Sell'} {plain_amount(float(qty or 0))} {shown}\n" + (note + "\n" if note else "") + f"এখন হোল্ডিং: {plain_amount(nq)} {base}"
+
+
+async def finish_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str, text: str) -> None:
+    """Parse, record, confirm, and refresh the open portfolio screen (edited in place, not re-sent)."""
+    assert BOT is not None
+    msg = update.effective_message
+    if not BOT.db: await msg.reply_text("Portfolio-র জন্য DATABASE_URL প্রয়োজন।"); return
+    try:
+        parsed = parse_trade_text(text, BOT.known_bases())
+        await BOT.ensure_user(update); uid = update.effective_user.id
+        result = await apply_portfolio_trade(uid, side, parsed["symbol"], parsed["qty"], parsed["price"])
+    except (ValueError, UserInputError) as exc:
+        context.user_data["pf_pending"] = {"side": side, "at": time.time()}      # let them retry without pressing the button again
+        await msg.reply_text(f"⚠️ {exc}\nআবার লিখুন (বাতিল করতে: cancel)।"); return
+    await msg.reply_text(result)
+    view = PF_VIEWS.get(uid)
+    if view:
+        view["expires"] = time.time() + PF_LIVE_MINUTES * 60
+        try: await portfolio_push(context.bot, uid, view)
+        except (BadRequest, NetworkError, TimedOut) as exc: forget_if_gone(uid, exc)
+
+
+async def portfolio_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str) -> None:
+    if not context.args:
+        context.user_data["pf_pending"] = {"side": "buy" if side == "buy" else "sell", "at": time.time()}
+        example = "ETH 0.5 2000" if side == "buy" else "ETH 0.2 2100"
+        await update.effective_message.reply_text(f"{'🟢 কী কিনেছেন' if side == 'buy' else '🔴 কী বিক্রি করেছেন'}? লিখুন: coin, পরিমাণ, দাম\nউদাহরণ: {example}\n(বাতিল করতে: cancel)"); return
+    await finish_trade(update, context, side, " ".join(context.args))
+
+
+async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: await portfolio_trade(update, context, "buy")
+async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: await portfolio_trade(update, context, "sell")
 
 
 async def portfolio_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5218,6 +5537,7 @@ async def post_init(application: Application) -> None:
         jq.run_repeating(guarded_job(channel_price_job), interval=60, first=45, name="channel-price-cards")
         jq.run_repeating(guarded_job(subscription_expiry_job), interval=3600, first=60, name="subscription-expiry")
         jq.run_repeating(guarded_job(report_job), interval=300, first=90, name="auto-report")
+        jq.run_repeating(guarded_job(portfolio_refresh_job), interval=PF_REFRESH_SECONDS, first=PF_REFRESH_SECONDS, name="portfolio-refresh")
         jq.run_repeating(guarded_job(retention_job), interval=21600, first=300, name="analyses-retention")
 
 async def post_shutdown(application: Application) -> None:
