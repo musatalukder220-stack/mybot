@@ -3566,6 +3566,95 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.effective_message.reply_text("Settings\n\n"+current,reply_markup=settings_keyboard())
 
 
+# ---------------------------------------------------------------- admin panel (one message, edited in place)
+ADMIN_PAGE = 8
+
+
+def _btn(text: str, data: str) -> Any: return InlineKeyboardButton(text, callback_data=data)
+
+
+def admin_home_ui() -> tuple[str, Any]:
+    return "🛠 Admin Panel", InlineKeyboardMarkup([[_btn("Pending Requests", "admpending|0"), _btn("Users", "adminusers|0")], [_btn("System Health", "adminhealth")]])
+
+
+def admin_nav(prefix: str, page: int, has_next: bool, rows: list[list[Any]]) -> Any:
+    """List buttons, then ◀ Back / Next ▶ (only when they apply), then a way home."""
+    nav = ([_btn("◀ Back", f"{prefix}|{page - 1}")] if page > 0 else []) + ([_btn("Next ▶", f"{prefix}|{page + 1}")] if has_next else [])
+    return InlineKeyboardMarkup(rows + ([nav] if nav else []) + [[_btn("← Admin", "adminhome")]])
+
+
+def _page_arg(parts: list[str], index: int) -> int:
+    return int(parts[index]) if len(parts) > index and parts[index].isdigit() else 0
+
+
+def plan_label(row: Any) -> str:
+    if row["telegram_id"] in ADMIN_IDS: return "admin"
+    if row["blocked"]: return "blocked"
+    until = row["plan_until"]
+    return "pro" if row["plan"] == "pro" and until and until > datetime.now(timezone.utc) else "free"
+
+
+async def admin_pending_ui(page: int) -> tuple[str, Any]:
+    assert BOT is not None and BOT.db is not None
+    rows = await BOT.db.fetch("SELECT id,telegram_id,days FROM subscription_requests WHERE status='pending' ORDER BY id DESC LIMIT $1 OFFSET $2", ADMIN_PAGE + 1, page * ADMIN_PAGE)
+    if not rows and page > 0: return await admin_pending_ui(page - 1)
+    more = len(rows) > ADMIN_PAGE; rows = rows[:ADMIN_PAGE]
+    buttons = [[_btn(f"#{r['id']} • {r['telegram_id']} • {r['days']}d", f"admreq|{r['id']}|{page}")] for r in rows]
+    return ("Pending requests" + (f" (পাতা {page + 1})" if page else "") if rows else "Pending request নেই।"), admin_nav("admpending", page, more, buttons)
+
+
+async def admin_users_ui(page: int) -> tuple[str, Any]:
+    assert BOT is not None and BOT.db is not None
+    rows = await BOT.db.fetch("SELECT telegram_id,username,plan,plan_until,blocked FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2", ADMIN_PAGE + 1, page * ADMIN_PAGE)
+    if not rows and page > 0: return await admin_users_ui(page - 1)
+    more = len(rows) > ADMIN_PAGE; rows = rows[:ADMIN_PAGE]
+    icons = {"admin": "👑", "blocked": "🚫", "pro": "✅", "free": "⚪"}
+    buttons = [[_btn(f"{icons[plan_label(r)]} @{r['username'] or 'no_username'} • {plan_label(r)}", f"admuser|{r['telegram_id']}|{page}")] for r in rows]
+    return "সাম্প্রতিক users" + (f" (পাতা {page + 1})" if page else "") + ":", admin_nav("adminusers", page, more, buttons)
+
+
+async def admin_request_ui(request_id: int, page: int) -> tuple[str, Any, bool]:
+    assert BOT is not None and BOT.db is not None
+    r = await BOT.db.fetchrow("SELECT * FROM subscription_requests WHERE id=$1", request_id)
+    back = [[_btn("← Pending", f"admpending|{page}"), _btn("← Admin", "adminhome")]]
+    if not r: return "Request পাওয়া যায়নি।", InlineKeyboardMarkup(back), False
+    rows: list[list[Any]] = []
+    if r["status"] == "pending":
+        rows.append([_btn("✅ Accept", f"admacc|{r['id']}|{page}"), _btn("❌ Reject", f"admrej|{r['id']}|{page}")])
+    rows.append([InlineKeyboardButton("📋 Copy User ID", copy_text=CopyTextButton(str(r["telegram_id"]))), InlineKeyboardButton("📋 Copy command", copy_text=CopyTextButton(f"/approve {r['telegram_id']} {r['days']}"))])
+    rows.append([_btn("👤 User details", f"admuser|{r['telegram_id']}|0")])
+    text = f"Request #{r['id']}\nUser: <code>{r['telegram_id']}</code>\nDays: {r['days']}\nTrxID: {html.escape(str(r['transaction_id'] or '—'))}\nStatus: {r['status']}"
+    return text, InlineKeyboardMarkup(rows + back), True
+
+
+async def admin_user_ui(uid: int, page: int, note: str = "") -> tuple[str, Any]:
+    assert BOT is not None and BOT.db is not None
+    r = await BOT.db.fetchrow("SELECT * FROM users WHERE telegram_id=$1", uid)
+    back = [_btn("← Users", f"adminusers|{page}"), _btn("← Admin", "adminhome")]
+    if not r: return "User নেই।", InlineKeyboardMarkup([back])
+    is_admin = uid in ADMIN_IDS
+    until = r["plan_until"]
+    lines = ([html.escape(note), ""] if note else []) + [f"User: <code>{uid}</code>", f"@{html.escape(r['username'] or '-')}"]
+    if is_admin:
+        lines += ["Plan: admin 👑", "Access: Unlimited ♾"]
+        rows: list[list[Any]] = [[InlineKeyboardButton("📋 Copy User ID", copy_text=CopyTextButton(str(uid)))], back]
+    else:
+        lines += [f"Plan: {plan_label(r)}", f"Until: {until:%Y-%m-%d %H:%M} UTC" if until else "Until: —", f"Blocked: {r['blocked']}"]
+        action = "admunblock" if r["blocked"] else "admblock"
+        rows = [[InlineKeyboardButton("📋 Copy User ID", copy_text=CopyTextButton(str(uid)))],
+                [_btn(f"+{d} দিন", f"admext|{uid}|{d}|{page}") for d in (7, 30, 90)],
+                [_btn("✅ Unblock" if r["blocked"] else "🚫 Block", f"{action}|{uid}|{page}")], back]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def admin_show(q: Any, text: str, kb: Any, html_mode: bool = False) -> None:
+    """Replace the current admin message instead of sending another one."""
+    try:
+        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML if html_mode else None)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower(): raise
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     q=update.callback_query; await q.answer(); data=q.data or ""
@@ -3602,63 +3691,56 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if data.startswith("adm") or data=="adminhome":
             if update.effective_user.id not in ADMIN_IDS: await q.message.reply_text("অনুমতি নেই।"); return
             if not BOT.db: await q.message.reply_text("DATABASE_URL সেট করা নেই।"); return
-            if data=="adminhome":
-                kb=InlineKeyboardMarkup([[InlineKeyboardButton("Pending Requests",callback_data="admpending"),InlineKeyboardButton("Users",callback_data="adminusers")],[InlineKeyboardButton("System Health",callback_data="adminhealth")]])
-                await q.message.reply_text("Admin Panel",reply_markup=kb); return
-            if data=="admpending":
-                rows=await BOT.db.fetch("SELECT id,telegram_id,days FROM subscription_requests WHERE status='pending' ORDER BY id DESC LIMIT 20")
-                buttons=[[InlineKeyboardButton(f"#{r['id']} • {r['telegram_id']} • {r['days']}d",callback_data=f"admreq|{r['id']}")] for r in rows]
-                buttons.append([InlineKeyboardButton("← Admin",callback_data="adminhome")])
-                await q.message.reply_text("Pending requests" if rows else "Pending request নেই।",reply_markup=InlineKeyboardMarkup(buttons)); return
-            if data=="adminusers":
-                rows=await BOT.db.fetch("SELECT telegram_id,username,plan,plan_until,blocked FROM users ORDER BY created_at DESC LIMIT 30")
-                buttons=[[InlineKeyboardButton(f"{'🚫' if r['blocked'] else '✅'} @{r['username'] or 'no_username'}",callback_data=f"admuser|{r['telegram_id']}")] for r in rows]
-                buttons.append([InlineKeyboardButton("← Admin",callback_data="adminhome")])
-                await q.message.reply_text("সাম্প্রতিক users:",reply_markup=InlineKeyboardMarkup(buttons)); return
-            if data=="adminhealth":
-                await q.message.reply_text(f"DB: ok\nCache: {len(BOT.cache._data)}\nLast alert scan: {BOT.last_alert_scan or 'not yet'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Admin",callback_data="adminhome")]])); return
-            if parts[0]=="admreq" and len(parts)==2:
-                r=await BOT.db.fetchrow("SELECT * FROM subscription_requests WHERE id=$1",int(parts[1]))
-                if not r: await q.message.reply_text("Request পাওয়া যায়নি।"); return
-                approve_cmd=f"/approve {r['telegram_id']} {r['days']}"
-                kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{r['id']}")],[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(r['telegram_id']))),InlineKeyboardButton("📋 Copy command",copy_text=CopyTextButton(approve_cmd))]])
-                await q.message.reply_text(f"Request #{r['id']}\nUser: <code>{r['telegram_id']}</code>\nDays: {r['days']}\nTrxID: {r['transaction_id'] or '—'}\nStatus: {r['status']}",reply_markup=kb,parse_mode=ParseMode.HTML); return
-            if parts[0]=="admacc" and len(parts)==2:
-                r=await BOT.db.fetchrow("SELECT * FROM subscription_requests WHERE id=$1 AND status='pending'",int(parts[1]))
-                if not r: await q.message.reply_text("Request pending নেই।"); return
-                await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',blocked=FALSE WHERE telegram_id=$1",r['telegram_id'],r['days'])
-                await BOT.db.execute("UPDATE subscription_requests SET status='approved',reviewed_at=NOW() WHERE id=$1",r['id'])
-                await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'approve',$2,$3::jsonb)",update.effective_user.id,r['telegram_id'],json.dumps({"days":r['days'],"request_id":r['id']}))
-                await BOT.db.execute("UPDATE users SET expiry_3d_sent=FALSE,expiry_1d_sent=FALSE WHERE telegram_id=$1",r['telegram_id'])
-                await set_user_menu(context.bot,r['telegram_id'],"pro"); await reward_referrer(context.bot,r['telegram_id'])
-                await context.bot.send_message(r['telegram_id'],f"🎉 আপনার Pro access অনুমোদিত হয়েছে।\nমেয়াদ: {r['days']} দিন\n/guide দিয়ে সব সুবিধা দেখুন।")
-                await q.edit_message_reply_markup(reply_markup=None); await q.message.reply_text("✅ Approved"); return
-            if parts[0]=="admrej" and len(parts)==2:
+            cmd=parts[0]
+            if cmd=="adminhome": await admin_show(q,*admin_home_ui()); return
+            if cmd=="admpending": await admin_show(q,*await admin_pending_ui(_page_arg(parts,1))); return
+            if cmd=="adminusers": await admin_show(q,*await admin_users_ui(_page_arg(parts,1))); return
+            if cmd=="adminhealth":
+                await admin_show(q,f"System Health\n\nDB: ok\nCache: {len(BOT.cache._data)}\nLast alert scan: {BOT.last_alert_scan or 'not yet'}",InlineKeyboardMarkup([[_btn("🔄 Refresh","adminhealth"),_btn("← Admin","adminhome")]])); return
+            if cmd=="admreq" and len(parts)>=2 and parts[1].isdigit():
+                text,kb,ok=await admin_request_ui(int(parts[1]),_page_arg(parts,2)); await admin_show(q,text,kb,ok); return
+            if cmd in {"admacc","admrej"} and len(parts)>=2 and parts[1].isdigit():
+                page=_page_arg(parts,2); after=InlineKeyboardMarkup([[_btn("Pending Requests",f"admpending|{page}"),_btn("← Admin","adminhome")]])
+                if cmd=="admacc":
+                    r=await BOT.db.fetchrow("SELECT * FROM subscription_requests WHERE id=$1 AND status='pending'",int(parts[1]))
+                    if not r: await admin_show(q,"Request আর pending নেই।",after); return
+                    await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',blocked=FALSE WHERE telegram_id=$1",r['telegram_id'],r['days'])
+                    await BOT.db.execute("UPDATE subscription_requests SET status='approved',reviewed_at=NOW() WHERE id=$1",r['id'])
+                    await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'approve',$2,$3::jsonb)",update.effective_user.id,r['telegram_id'],json.dumps({"days":r['days'],"request_id":r['id']}))
+                    await BOT.db.execute("UPDATE users SET expiry_3d_sent=FALSE,expiry_1d_sent=FALSE WHERE telegram_id=$1",r['telegram_id'])
+                    await set_user_menu(context.bot,r['telegram_id'],"pro"); await reward_referrer(context.bot,r['telegram_id'])
+                    try: await context.bot.send_message(r['telegram_id'],f"🎉 আপনার Pro access অনুমোদিত হয়েছে।\nমেয়াদ: {r['days']} দিন\n/guide দিয়ে সব সুবিধা দেখুন।")
+                    except Exception: log.warning("Could not tell user %s about approval",r['telegram_id'])
+                    await admin_show(q,f"✅ Request #{r['id']} approved\nUser: {r['telegram_id']} • {r['days']} দিন",after); return
                 r=await BOT.db.fetchrow("UPDATE subscription_requests SET status='rejected',reviewed_at=NOW() WHERE id=$1 AND status='pending' RETURNING telegram_id",int(parts[1]))
                 if r:
-                    await context.bot.send_message(r['telegram_id'],f"আপনার subscription request #{parts[1]} অনুমোদিত হয়নি। বিস্তারিত জানতে Admin-এর সঙ্গে যোগাযোগ করুন।",reply_markup=InlineKeyboardMarkup([[contact_button()]]))
-                await q.edit_message_reply_markup(reply_markup=None); await q.message.reply_text("❌ Rejected"); return
-            if parts[0]=="admuser" and len(parts)==2:
-                uid=int(parts[1]); r=await BOT.db.fetchrow("SELECT * FROM users WHERE telegram_id=$1",uid)
-                if not r: await q.message.reply_text("User নেই।"); return
-                action="admunblock" if r['blocked'] else "admblock"; label="✅ Unblock" if r['blocked'] else "🚫 Block"
-                kb=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(uid)))],[InlineKeyboardButton("+7 দিন",callback_data=f"admext|{uid}|7"),InlineKeyboardButton("+30 দিন",callback_data=f"admext|{uid}|30"),InlineKeyboardButton("+90 দিন",callback_data=f"admext|{uid}|90")],[InlineKeyboardButton(label,callback_data=f"{action}|{uid}")],[InlineKeyboardButton("← Users",callback_data="adminusers")]])
-                await q.message.reply_text(f"User: <code>{uid}</code>\n@{html.escape(r['username'] or '-')}\nPlan: {r['plan']}\nUntil: {r['plan_until']}\nBlocked: {r['blocked']}",reply_markup=kb,parse_mode=ParseMode.HTML); return
-            if parts[0]=="admext" and len(parts)==3:
-                uid,days=int(parts[1]),int(parts[2]); await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',expiry_3d_sent=FALSE,expiry_1d_sent=FALSE WHERE telegram_id=$1",uid,days)
-                await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'extend',$2,$3::jsonb)",update.effective_user.id,uid,json.dumps({"days":days}))
-                await set_user_menu(context.bot,uid,"pro")
-                try: await context.bot.send_message(uid,f"✅ আপনার Pro access {days} দিন বাড়ানো হয়েছে।")
-                except Exception: pass
-                await q.message.reply_text(f"✅ User {uid}: +{days} days"); return
-            if parts[0] in {"admblock","admunblock"} and len(parts)==2:
-                uid=int(parts[1]); blocked=parts[0]=="admblock"
-                await BOT.db.execute("UPDATE users SET blocked=$1 WHERE telegram_id=$2",blocked,uid)
-                await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,$2,$3,'{}'::jsonb)",update.effective_user.id,"block" if blocked else "unblock",uid)
-                await set_user_menu(context.bot,uid,"free" if blocked else await BOT.effective_plan(uid))
-                try: await context.bot.send_message(uid,"আপনার bot access block করা হয়েছে।" if blocked else "আপনার bot access unblock করা হয়েছে।")
-                except Exception: pass
-                await q.message.reply_text("Blocked" if blocked else "Unblocked"); return
+                    try: await context.bot.send_message(r['telegram_id'],f"আপনার subscription request #{parts[1]} অনুমোদিত হয়নি। বিস্তারিত জানতে Admin-এর সঙ্গে যোগাযোগ করুন।",reply_markup=InlineKeyboardMarkup([[contact_button()]]))
+                    except Exception: log.warning("Could not tell user %s about rejection",r['telegram_id'])
+                await admin_show(q,f"❌ Request #{parts[1]} rejected" if r else "Request আর pending নেই।",after); return
+            if cmd=="admuser" and len(parts)>=2 and parts[1].isdigit():
+                text,kb=await admin_user_ui(int(parts[1]),_page_arg(parts,2)); await admin_show(q,text,kb,True); return
+            if cmd=="admext" and len(parts)>=3 and parts[1].isdigit() and parts[2].isdigit():
+                uid,days=int(parts[1]),int(parts[2]); page=_page_arg(parts,3)
+                if uid in ADMIN_IDS: note="ℹ️ Admin-এর access সবসময় Unlimited — মেয়াদ বাড়ানোর দরকার নেই।"
+                else:
+                    await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',expiry_3d_sent=FALSE,expiry_1d_sent=FALSE WHERE telegram_id=$1",uid,days)
+                    await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'extend',$2,$3::jsonb)",update.effective_user.id,uid,json.dumps({"days":days}))
+                    await set_user_menu(context.bot,uid,"pro")
+                    try: await context.bot.send_message(uid,f"✅ আপনার Pro access {days} দিন বাড়ানো হয়েছে।")
+                    except Exception: pass
+                    note=f"✅ +{days} দিন যোগ হয়েছে"
+                text,kb=await admin_user_ui(uid,page,note); await admin_show(q,text,kb,True); return
+            if cmd in {"admblock","admunblock"} and len(parts)>=2 and parts[1].isdigit():
+                uid=int(parts[1]); page=_page_arg(parts,2); blocked=cmd=="admblock"
+                if uid in ADMIN_IDS: note="ℹ️ Admin-কে block করা যায় না।"
+                else:
+                    await BOT.db.execute("UPDATE users SET blocked=$1 WHERE telegram_id=$2",blocked,uid)
+                    await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,$2,$3,'{}'::jsonb)",update.effective_user.id,"block" if blocked else "unblock",uid)
+                    await set_user_menu(context.bot,uid,"free" if blocked else await BOT.effective_plan(uid))
+                    try: await context.bot.send_message(uid,"আপনার bot access block করা হয়েছে।" if blocked else "আপনার bot access unblock করা হয়েছে।")
+                    except Exception: pass
+                    note="🚫 Blocked" if blocked else "✅ Unblocked"
+                text,kb=await admin_user_ui(uid,page,note); await admin_show(q,text,kb,True); return
         if data=="guidehome":
             plan=await BOT.effective_plan(update.effective_user.id)
             await q.message.reply_text("Interactive Guide — একটি বিভাগ নির্বাচন করুন:",reply_markup=guide_keyboard(plan)); return
@@ -4290,14 +4372,13 @@ async def user_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     raw=context.args[0]
     row=await (BOT.db.fetchrow("SELECT * FROM users WHERE telegram_id=$1",int(raw)) if raw.isdigit() else BOT.db.fetchrow("SELECT * FROM users WHERE lower(username)=lower($1)",raw.lstrip('@')))
     if not row: await update.effective_message.reply_text("User পাওয়া যায়নি।"); return
-    uid=row['telegram_id']; action="admunblock" if row['blocked'] else "admblock"; label="✅ Unblock" if row['blocked'] else "🚫 Block"
-    kb=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(uid)))],[InlineKeyboardButton("+7 দিন",callback_data=f"admext|{uid}|7"),InlineKeyboardButton("+30 দিন",callback_data=f"admext|{uid}|30"),InlineKeyboardButton("+90 দিন",callback_data=f"admext|{uid}|90")],[InlineKeyboardButton(label,callback_data=f"{action}|{uid}")]])
-    await update.effective_message.reply_text(f"User: <code>{uid}</code>\n@{html.escape(row['username'] or '-')}\nPlan: {row['plan']}\nUntil: {row['plan_until']}\nBlocked: {row['blocked']}",parse_mode=ParseMode.HTML,reply_markup=kb)
+    text,kb=await admin_user_ui(row['telegram_id'],0)
+    await update.effective_message.reply_text(text,parse_mode=ParseMode.HTML,reply_markup=kb)
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     if update.effective_user.id not in ADMIN_IDS: await update.effective_message.reply_text("অনুমতি নেই।"); return
-    await update.effective_message.reply_text("Admin Panel",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Pending Requests",callback_data="admpending"),InlineKeyboardButton("Users",callback_data="adminusers")],[InlineKeyboardButton("System Health",callback_data="adminhealth")]]))
+    text,kb=admin_home_ui(); await update.effective_message.reply_text(text,reply_markup=kb)
 
 async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context; assert BOT is not None
@@ -4490,7 +4571,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def subscription_expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if not BOT.db: return
-    rows=await BOT.db.fetch("SELECT telegram_id,plan_until,expiry_3d_sent,expiry_1d_sent FROM users WHERE plan='pro' AND NOT blocked AND plan_until IS NOT NULL AND plan_until<=NOW()+INTERVAL '3 days'")
+    rows=await BOT.db.fetch("SELECT telegram_id,plan_until,expiry_3d_sent,expiry_1d_sent FROM users WHERE plan='pro' AND NOT blocked AND plan_until IS NOT NULL AND plan_until<=NOW()+INTERVAL '3 days' AND telegram_id<>ALL($1::bigint[])",sorted(ADMIN_IDS))
     now=datetime.now(timezone.utc)
     for r in rows:
         seconds=(r['plan_until']-now).total_seconds()
@@ -5909,6 +5990,8 @@ async def start_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     q = update.callback_query
     if TRIAL_DAYS <= 0 or not BOT.db:
         await q.message.reply_text("Free trial এখন চালু নেই।"); return
+    if update.effective_user.id in ADMIN_IDS:
+        await q.message.reply_text("আপনি Admin — আপনার access Unlimited, trial লাগবে না।"); return
     await BOT.ensure_user(update)
     until = await BOT.db.fetchval("""UPDATE users SET plan='pro',plan_until=NOW()+$2*INTERVAL '1 day',trial_used=TRUE WHERE telegram_id=$1 AND NOT trial_used AND NOT blocked
         AND (plan<>'pro' OR plan_until IS NULL OR plan_until<NOW()) RETURNING plan_until""", update.effective_user.id, TRIAL_DAYS)
@@ -5931,6 +6014,7 @@ PRO_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("gu
 ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("price_alert","Channel price card ON/Update"),BotCommand("price_alerts","Channel price card ON/OFF list"),BotCommand("admin","Admin panel"),BotCommand("stats","System statistics")]
 
 async def set_user_menu(bot: Any,user_id:int,plan:str) -> None:
+    if user_id in ADMIN_IDS and plan!="blocked": plan="admin"          # an admin always keeps the admin menu
     commands=ADMIN_COMMANDS if plan=="admin" else PRO_COMMANDS if plan=="pro" else PUBLIC_COMMANDS
     try: await bot.set_my_commands(commands,scope=BotCommandScopeChat(chat_id=user_id))
     except Exception: log.warning("Could not set command scope for %s",user_id)
