@@ -1651,7 +1651,7 @@ def _in_range(price: float, lo: float, hi: float) -> bool:
 def draw_overlays(ax: Any, view: pd.DataFrame, professional: dict[str, Any] | None, offset: int = 0, *,
                   max_fvg: int = 4, max_ob: int = 3, max_sweeps: int = 4, show_vwap: bool = True, show_profile: bool = True, tv: bool = False) -> dict[str, int]:
     """Draw overlays on ``ax`` and return how many items of each kind were drawn. ``tv`` = the quieter TradingView-style look."""
-    gold, grey, blue = ("#d97706", "#5d606b", "#1e88e5") if tv else (GOLD, GREY, BLUE)         # darker inks on the pale-yellow canvas
+    gold, grey, blue = (TV_GOLD, TV_GREY, TV_BLUE) if tv else (GOLD, GREY, BLUE)         # inks follow the chart theme
     note = {"fontproperties": tv_font("semibold", 7.4), "zorder": 7, "bbox": {"boxstyle": "round,pad=0.12", "facecolor": TV_BG, "edgecolor": "none", "alpha": .8}} if tv else {"fontsize": 6.5}
     drawn = {"fvg": 0, "order_blocks": 0, "sweeps": 0, "equal_levels": 0, "profile": 0, "vwap": 0}
     n = len(view)
@@ -1719,9 +1719,9 @@ def legend_entries(drawn: dict[str, int], tv: bool = False) -> list[tuple[str, s
     """(label, color, linestyle) triples for the items that were actually drawn."""
     out = []
     if drawn.get("vwap"):
-        out.append(("VWAP", "#1e88e5" if tv else BLUE, "-."))
+        out.append(("VWAP", TV_BLUE if tv else BLUE, "-."))
     if drawn.get("profile"):
-        out.append(("POC/VAH/VAL", "#d97706" if tv else GOLD, "-"))
+        out.append(("POC/VAH/VAL", TV_GOLD if tv else GOLD, "-"))
     if drawn.get("fvg"):
         out.append(("FVG", GREEN, ":"))
     if drawn.get("order_blocks"):
@@ -1730,13 +1730,36 @@ def legend_entries(drawn: dict[str, int], tv: bool = False) -> list[tuple[str, s
 
 
 # ==========================================================================
-# TradingView-style chart: pale-yellow canvas, no grid, flush colour tags on the right-hand price scale
+# TradingView-style chart (desktop look): dark canvas, subtle grid, volume band, flush colour tags on the right-hand price scale.
+# CHART_THEME=dark (default) or paper (the earlier pale-yellow canvas).
 # ==========================================================================
-TV_BG, TV_TEXT, TV_MUTED, TV_FAINT = "#fff9c4", "#131722", "#5d606b", "#8d8f98"
-TV_UP, TV_DOWN = "#089981", "#f23645"
-TV_SUPPORT, TV_RESIST, TV_TRIG_UP, TV_TRIG_DOWN = "#4caf50", "#f23645", "#2962ff", "#ffa726"
-TV_EMA = (("EMA 20", "EMA20", "#2962ff"), ("EMA 50", "EMA50", "#ff6d00"), ("EMA 200", "EMA200", "#9c27b0"))
+CHART_THEMES: dict[str, dict[str, Any]] = {
+    "dark": {
+        "bg": "#131722", "bg_top": "#181d2c", "bg_bot": "#0f121b", "text": "#d1d4dc", "muted": "#868993", "faint": "#5d606b",
+        "grid": "#212638", "edge": "#2a2e39", "up": "#089981", "down": "#f23645", "support": "#2ebd85", "resist": "#f23645",
+        "trig_up": "#2962ff", "trig_down": "#ff9800", "trend": "#4d8bff",
+        "ema": (("EMA 20", "EMA20", "#4d8bff"), ("EMA 50", "EMA50", "#ff9800"), ("EMA 200", "EMA200", "#c77dff")),
+        "gold": "#f5a623", "grey": "#9598a1", "blue": "#4d9bff", "zone_alpha": .10, "vol_alpha": .55, "watermark_alpha": .06, "level_alpha": .62,
+    },
+    "paper": {
+        "bg": "#fff9c4", "bg_top": None, "bg_bot": None, "text": "#131722", "muted": "#5d606b", "faint": "#8d8f98",
+        "grid": None, "edge": "#d9d3a0", "up": "#089981", "down": "#f23645", "support": "#4caf50", "resist": "#f23645",
+        "trig_up": "#2962ff", "trig_down": "#ffa726", "trend": "#2962ff",
+        "ema": (("EMA 20", "EMA20", "#2962ff"), ("EMA 50", "EMA50", "#ff6d00"), ("EMA 200", "EMA200", "#9c27b0")),
+        "gold": "#d97706", "grey": "#5d606b", "blue": "#1e88e5", "zone_alpha": .14, "vol_alpha": .4, "watermark_alpha": .06, "level_alpha": 1.0,
+    },
+}
+CHART_THEME = os.getenv("CHART_THEME", "dark").strip().lower()
+if CHART_THEME not in CHART_THEMES: CHART_THEME = "dark"
+_T = CHART_THEMES[CHART_THEME]
+TV_BG, TV_TEXT, TV_MUTED, TV_FAINT = _T["bg"], _T["text"], _T["muted"], _T["faint"]
+TV_UP, TV_DOWN = _T["up"], _T["down"]
+TV_SUPPORT, TV_RESIST, TV_TRIG_UP, TV_TRIG_DOWN = _T["support"], _T["resist"], _T["trig_up"], _T["trig_down"]
+TV_EMA = _T["ema"]
+TV_GOLD, TV_GREY, TV_BLUE = _T["gold"], _T["grey"], _T["blue"]
 TV_W, TV_H, TV_TIME_H, TV_TAG_H = 1280, 800, 34, 19          # picture size and fixed pixel bands (time axis, price tag height)
+TV_TAG_PAD, TV_AXIS_MARGIN = 8, 12                           # px: padding inside a price tag, gap between the tags and the picture's right edge
+TV_HEAD_FRAC, TV_VOL_FRAC = .17, .13                          # share of the plot kept free for the header (top) and the volume band (bottom)
 _TV_FONT_PATHS: dict[str, str] = {}
 
 
@@ -1835,14 +1858,27 @@ def spread_tags(prices: list[float], gap: float, low: float, high: float) -> lis
     return out
 
 
+def compact_num(v: float) -> str:
+    """12.3K / 4.56M / 1.20B for the volume readout."""
+    a = abs(v)
+    for limit, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if a >= limit: return f"{v / limit:.2f}{suffix}"
+    return f"{v:.2f}"
+
+
 def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False) -> io.BytesIO:
-    """TradingView-look picture, 1280x800 (inside Telegram's photo limit, so it is shown 1:1 and not re-scaled)."""
+    """TradingView-desktop-look picture, 1280x800 (inside Telegram's photo limit, so it is shown 1:1 and not re-scaled)."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.figure import Figure
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Rectangle as Rect
     from matplotlib.ticker import MaxNLocator
     from matplotlib.transforms import blended_transform_factory
     view, offset = split_view(frame, request.view_candles)        # indicators were warmed up on the full frame
     n = len(view); x = np.arange(n)
     o, h, l, c = (view[k].astype(float).to_numpy() for k in ("Open", "High", "Low", "Close"))
+    vol = np.nan_to_num(view["Volume"].astype(float).to_numpy()) if "Volume" in view.columns else np.zeros(n)
     lo, hi = float(l.min()), float(h.max()); span = max(hi - lo, abs(c[-1]) * 1e-4, 1e-12)
     up = c >= o; colors = np.where(up, TV_UP, TV_DOWN)
     dec = min(data_decimals(view["Close"].to_numpy()), price_decimals(float(view["Close"].iloc[-1])))      # the market's own precision, never more than the price needs
@@ -1857,83 +1893,114 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
         if bo.get(key): items.append({"text": f"{name}  {money(float(bo[key]))}", "y": float(bo[key]), "color": color})
     items = [it for it in items if lo - .35 * span <= it["y"] <= hi + .35 * span]       # far-away levels stay in the written report, not the picture
     last = float(c[-1]); last_color = TV_UP if up[-1] else TV_DOWN
-    longest = max([len(it["text"]) for it in items] + [len(money(last)), 8])
-    axis_w = min(210.0, max(78.0, 8.6 * longest + 18))                         # the price column, like TradingView's
-    plot_w, plot_h = TV_W - axis_w, TV_H - TV_TIME_H
+    plot_h = TV_H - TV_TIME_H
     ys = [lo, hi] + [it["y"] for it in items]
-    ymin = min(ys) - span * .07; top = max(ys) + span * .03
-    ymax = ymin + (top - ymin) / 0.84                                          # top 16% is left free for the header lines
+    data_lo = min(ys); data_hi = max(ys) + span * .03
+    total = (data_hi - data_lo) / (1 - TV_HEAD_FRAC - TV_VOL_FRAC)             # header strip on top, volume band underneath, candles in between
+    ymin = data_lo - total * TV_VOL_FRAC; ymax = data_hi + total * TV_HEAD_FRAC
+    px_y = (ymax - ymin) / plot_h                                              # price per pixel
+    edge = 14 * px_y                                                            # a label closer than this to the picture's edge would be cut off
+    price_ticks = [t for t in MaxNLocator(nbins=10, steps=[1, 2, 2.5, 5, 10]).tick_values(ymin, ymax) if ymin + edge < t < ymax - edge]
+    tick_dec = max(dec if (price_ticks[1] - price_ticks[0] if len(price_ticks) > 1 else 1) < 10 else 2, 0)
+    # The price column is sized from the measured pixel width of its widest text (tags and tick numbers), plus padding and a gap
+    # before the picture's right edge - so the tags hug their text like TradingView's instead of stretching to the edge.
+    probe = Figure(dpi=100); probe_renderer = FigureCanvasAgg(probe).get_renderer()
+    text_w = lambda txt, prop: probe.text(0, 0, txt, fontproperties=prop).get_window_extent(probe_renderer).width
+    tag_font, tick_font = tv_font("semibold", 8.6), tv_font("regular", 8.6)
+    widest = max([text_w(it["text"], tag_font) for it in items] + [text_w(money(last), tag_font)] + [text_w(f"{t:,.{tick_dec}f}", tick_font) for t in price_ticks])
+    tag_w = math.ceil(widest) + 2 * TV_TAG_PAD
+    axis_w = tag_w + TV_AXIS_MARGIN                                            # the price column, like TradingView's
+    plot_w = TV_W - axis_w
     right_pad = max(6, round(n * .08))
+    xlim = (-1.5, n - 1 + right_pad)
 
     fig = plt.figure(figsize=(TV_W / 100, TV_H / 100), dpi=100, facecolor=TV_BG)
-    ax = fig.add_axes([0, TV_TIME_H / TV_H, plot_w / TV_W, plot_h / TV_H], facecolor=TV_BG)
-    ax.set_xlim(-1.5, n - 1 + right_pad); ax.set_ylim(ymin, ymax)
+    if _T["bg_top"]:                                                            # whisper-soft vertical gradient behind everything
+        bgax = fig.add_axes([0, 0, 1, 1]); bgax.set_zorder(0); bgax.axis("off")
+        bgax.imshow(np.linspace(0, 1, 96).reshape(-1, 1), aspect="auto", extent=[0, 1, 0, 1], cmap=LinearSegmentedColormap.from_list("tvbg", [_T["bg_top"], _T["bg_bot"]]))
+    rect = [0, TV_TIME_H / TV_H, plot_w / TV_W, plot_h / TV_H]
+    axv = fig.add_axes(rect); axv.set_zorder(1); axv.patch.set_visible(False); axv.axis("off")        # volume band sits under the candles
+    ax = fig.add_axes(rect); ax.set_zorder(2); ax.patch.set_visible(False)
+    for a in (ax, axv): a.set_xlim(*xlim)
+    ax.set_ylim(ymin, ymax); axv.set_ylim(0, max(float(vol.max()), 1e-12) / (TV_VOL_FRAC * .8))
     for side in ax.spines.values(): side.set_visible(False)
     ax.tick_params(length=0)
-    px_y = (ymax - ymin) / plot_h                                              # price per pixel
+    to_axes = blended_transform_factory(ax.transAxes, ax.transData)
+    keep = Rect((xlim[0], ymin), xlim[1] - xlim[0], ymax - total * TV_HEAD_FRAC * .9 - ymin, transform=ax.transData)   # lines that run off the top stop below the header text
+    time_ticks = tv_time_ticks(view.index, request.timeframe, plot_w, right_pad)
 
-    # zones first (rectangles + hairlines), then level lines, then candles on top
+    # background furniture: faint grid, big symbol watermark, volume histogram
+    if _T["grid"]:
+        for t in price_ticks: ax.axhline(t, color=_T["grid"], linewidth=.8, zorder=.5)
+        for pos, _label, _bold in time_ticks: ax.axvline(pos, color=_T["grid"], linewidth=.8, zorder=.5)
+    base = request.symbol.split("/")[0]
+    ax.text(.5, .56, request.symbol.replace("/", ""), transform=ax.transAxes, ha="center", va="center", color=TV_TEXT, alpha=_T["watermark_alpha"], fontproperties=tv_font("bold", 70), zorder=.6)
+    ax.text(.5, .43, tf_label(request.timeframe).upper(), transform=ax.transAxes, ha="center", va="center", color=TV_TEXT, alpha=_T["watermark_alpha"], fontproperties=tv_font("semibold", 30), zorder=.6)
+    width = .72 if n <= 250 else .86
+    axv.bar(x, vol, width=width, color=colors, alpha=_T["vol_alpha"], linewidth=0)
+
+    # zones first (soft rectangles), then level lines, then candles on top
     for key, color in (("support_zones", TV_SUPPORT), ("resistance_zones", TV_RESIST)):
         for zone in result.get(key, []) or []:
             if zone["high"] >= ymin and zone["low"] <= ymax:
-                ax.add_patch(Rect((-1.5, zone["low"]), n + right_pad + 1, zone["high"] - zone["low"], facecolor=color, alpha=.14, linewidth=0, zorder=1))
-                for edge in (zone["low"], zone["high"]): ax.axhline(edge, color=color, linewidth=.7, alpha=.45, zorder=1)
-    for it in items: ax.axhline(it["y"], color=it["color"], linewidth=.9, zorder=2)
+                ax.add_patch(Rect((-1.5, zone["low"]), n + right_pad + 1, zone["high"] - zone["low"], facecolor=color, alpha=_T["zone_alpha"], linewidth=0, zorder=1))
+                for edge in (zone["low"], zone["high"]): ax.axhline(edge, color=color, linewidth=.6, alpha=.3, zorder=1)
+    for it in items: ax.axhline(it["y"], color=it["color"], linewidth=.9, alpha=_T["level_alpha"], zorder=2)
     ax.axhline(last, color=last_color, linewidth=.9, linestyle=(0, (1.2, 2.4)), zorder=2)
 
-    width = .72 if n <= 250 else .86
-    ax.vlines(x, l, h, colors=colors, linewidth=1.0 if n <= 220 else .7, zorder=4)
+    ax.vlines(x, l, h, colors=colors, linewidth=1.0 if n <= 220 else .7, zorder=4).set_clip_path(keep)
     ax.bar(x, np.maximum(np.abs(c - o), 1.2 * px_y), bottom=np.minimum(o, c), width=width, color=colors, edgecolor=colors, linewidth=.6, zorder=5)
     for _, col, color in TV_EMA:
-        if col in view.columns and view[col].notna().sum() > 1: ax.plot(x, view[col].astype(float).to_numpy(), color=color, linewidth=1.1, zorder=6)
+        if col in view.columns and view[col].notna().sum() > 1: ax.plot(x, view[col].astype(float).to_numpy(), color=color, linewidth=1.3, solid_capstyle="round", zorder=6)[0].set_clip_path(keep)
     for line in result.get("trendlines", []) or []:
         x0, x1 = line["start_idx"] - offset, line["end_idx"] - offset
         if x1 <= x0 or x1 < 0: continue
         y0, y1 = line["start_val"], line["end_val"]
         if x0 < 0: y0, x0 = y0 + (y1 - y0) * (0 - x0) / (x1 - x0), 0
-        ax.plot([x0, x1], [y0, y1], color="#2962ff", linewidth=1.4, linestyle=(0, (5, 3)), zorder=6)
+        ax.plot([x0, x1], [y0, y1], color=_T["trend"], linewidth=1.5, linestyle=(0, (5, 3)), zorder=6)[0].set_clip_path(keep)
     drawn = draw_overlays(ax, view, (result.get("quant") or {}).get("professional"), offset, tv=True) if overlays else {}
 
-    # price scale: dark numbers at the right, tags drawn flush against the plot
-    ticks = [t for t in MaxNLocator(nbins=13, steps=[1, 2, 2.5, 5, 10]).tick_values(ymin, ymax) if ymin < t < ymax]
+    # price scale: numbers at the right, tags drawn flush against the plot; a tick that a tag would cover is left out
     ax.set_yticks([]); ax.set_xticks([])
-    to_axes = blended_transform_factory(ax.transAxes, ax.transData)
-    tick_dec = max(dec if (ticks[1] - ticks[0] if len(ticks) > 1 else 1) < 10 else 2, 0)
-    for t in ticks:
-        ax.text(1.0, t, f"{t:,.{tick_dec}f}", transform=to_axes, ha="left", va="center", color=TV_TEXT, fontproperties=tv_font("regular", 8.6), clip_on=False,
-                bbox={"pad": 0, "facecolor": "none", "edgecolor": "none"}).set_x(1.0 + 9 / plot_w)
     gap = TV_TAG_H * px_y
     tags = items + [{"text": money(last), "y": last, "color": last_color, "last": True}]
     shown = spread_tags([t["y"] for t in tags], gap, ymin + gap / 2, ymax - gap / 2)
+    for t in price_ticks:
+        if any(abs(t - s) < gap * .85 for s in shown): continue
+        ax.text(1.0, t, f"{t:,.{tick_dec}f}", transform=to_axes, ha="left", va="center", color=TV_TEXT, alpha=.85, fontproperties=tick_font, clip_on=False,
+                bbox={"pad": 0, "facecolor": "none", "edgecolor": "none"}).set_x(1.0 + TV_TAG_PAD / plot_w)
     for tag, y in sorted(zip(tags, shown), key=lambda p: bool(p[0].get("last"))):
-        ax.add_patch(Rect((1.0, y - gap / 2), axis_w / plot_w, gap, transform=to_axes, facecolor=tag["color"], edgecolor="none", clip_on=False, zorder=20))
-        ax.text(1.0 + 9 / plot_w, y, tag["text"], transform=to_axes, ha="left", va="center", color="white", fontproperties=tv_font("semibold", 8.6), clip_on=False, zorder=21)
+        ax.add_patch(Rect((1.0, y - gap / 2), tag_w / plot_w, gap, transform=to_axes, facecolor=tag["color"], edgecolor="none", clip_on=False, zorder=20))
+        ax.text(1.0 + TV_TAG_PAD / plot_w, y, tag["text"], transform=to_axes, ha="left", va="center", color="white", fontproperties=tag_font, clip_on=False, zorder=21)
 
     # time scale at the bottom: round times, bold day/month/year changes
-    band = fig.add_axes([0, 0, plot_w / TV_W, TV_TIME_H / TV_H], facecolor=TV_BG); band.set_xlim(*ax.get_xlim()); band.axis("off")
-    for pos, label, bold in tv_time_ticks(view.index, request.timeframe, plot_w, right_pad):
-        band.text(pos, .5, label, ha="center", va="center", color=TV_TEXT, fontproperties=tv_font("bold" if bold else "regular", 8.6))
-    fig.text(14 / TV_W, (TV_TIME_H + 24) / TV_H, PRICE_CARD_BRAND or "CRYPTO AI MASTER", color=TV_TEXT, fontproperties=tv_font("bold", 14), va="center", ha="left", alpha=.5)
+    band = fig.add_axes([0, 0, plot_w / TV_W, TV_TIME_H / TV_H]); band.patch.set_visible(False); band.set_xlim(*xlim); band.axis("off"); band.set_zorder(2)
+    for pos, label, bold in time_ticks:
+        band.text(pos, .5, label, ha="center", va="center", color=TV_TEXT, alpha=1 if bold else .85, fontproperties=tv_font("bold" if bold else "regular", 8.6))
+    for xs, ys_ in (([plot_w / TV_W] * 2, [0, 1]), ([0, 1], [TV_TIME_H / TV_H] * 2)):                  # hairlines that frame the price column and the time strip
+        fig.add_artist(Line2D(xs, ys_, transform=fig.transFigure, color=_T["edge"], linewidth=.9, zorder=30))
 
-    # header over the chart: name, last candle OHLC, EMA values, then the indicator name
+    # header over the chart: name, last candle OHLC + change, EMA values, volume readout; brand at the top right
     renderer = fig.canvas.get_renderer()
     def flow(row_y: float, pieces: list[tuple[str, str, Any]]) -> None:
         cursor = 14 / TV_W
         for text, color, prop in pieces:
-            t = fig.text(cursor, 1 - row_y / TV_H, text, color=color, fontproperties=prop, va="center", ha="left")
+            t = fig.text(cursor, 1 - row_y / TV_H, text, color=color, fontproperties=prop, va="center", ha="left", zorder=40)
             cursor += t.get_window_extent(renderer).width / fig.bbox.width
-    base = request.symbol.split("/")[0]
     range_part = f" · last {range_label_en(request.range_days)}" if request.range_days else ""
     source = str(frame.attrs.get("source", "binance")).title()
-    flow(22, [(f"{COIN_NAMES.get(base, base)} / TetherUS", TV_TEXT, tv_font("semibold", 11.5)), (f" · {tf_label(request.timeframe)}{range_part} · {source}   ", TV_TEXT, tv_font("regular", 11.5))]
-         + [(f"{lab}{money(val)}   ", last_color, tv_font("regular", 9.6)) for lab, val in (("O", o[-1]), ("H", h[-1]), ("L", l[-1]), ("C", c[-1]))]
-         + ([(f"{c[-1] - c[-2]:+,.{dec}f} ({(c[-1] - c[-2]) / c[-2] * 100:+.2f}%)", last_color, tv_font("regular", 9.6))] if n > 1 and c[-2] else []))
+    ohlc: list[tuple[str, str, Any]] = []
+    for lab, val in (("O", o[-1]), ("H", h[-1]), ("L", l[-1]), ("C", c[-1])): ohlc += [(f"{lab} ", TV_MUTED, tv_font("regular", 9.6)), (f"{money(val)}   ", last_color, tv_font("regular", 9.6))]
+    change = [(f"{c[-1] - c[-2]:+,.{dec}f}  ({(c[-1] - c[-2]) / c[-2] * 100:+.2f}%)", last_color, tv_font("semibold", 9.6))] if n > 1 and c[-2] else []
+    flow(22, [(f"{COIN_NAMES.get(base, base)} / TetherUS", TV_TEXT, tv_font("semibold", 12.5)), (f"  ·  {tf_label(request.timeframe)}{range_part}  ·  {source}      ", TV_MUTED, tv_font("regular", 11.5))] + ohlc + change)
     extras: list[tuple[str, str, Any]] = []
     for name, col, color in TV_EMA:
         if col in view.columns and pd.notna(view[col].iloc[-1]): extras += [(f"{name}  ", TV_MUTED, tv_font("regular", 8.8)), (money(float(view[col].iloc[-1])) + "    ", color, tv_font("regular", 8.8))]
     for label, color, _style in legend_entries(drawn, tv=True): extras.append((f"{label}    ", color, tv_font("semibold", 8.8)))
     flow(46, extras)
-    flow(68, [(f"Crypto AI Master — {request.symbol.replace('/', '')} {tf_label(request.timeframe).upper()}", TV_FAINT, tv_font("regular", 9.2))])
+    flow(68, [("Volume  ", TV_MUTED, tv_font("regular", 8.8)), (compact_num(float(vol[-1])) + "    ", last_color, tv_font("regular", 8.8))]
+         + ([("Avg 20  ", TV_MUTED, tv_font("regular", 8.8)), (compact_num(float(np.mean(vol[-20:]))), TV_FAINT, tv_font("regular", 8.8))] if n >= 5 else []))
+    fig.text((plot_w - 14) / TV_W, 1 - 22 / TV_H, PRICE_CARD_BRAND or "CRYPTO AI MASTER", color=TV_TEXT, alpha=.6, fontproperties=tv_font("bold", 11), va="center", ha="right", zorder=40)
 
     raw = io.BytesIO(); fig.savefig(raw, format="png", dpi=200, facecolor=fig.get_facecolor()); plt.close(fig)
     raw.seek(0)
