@@ -1,0 +1,59 @@
+# mybot — Crypto Analyst Telegram Bot
+
+বাংলা/English crypto technical-analysis Telegram bot. Ask in plain text or voice ("BTC 4h", "ETH-এর ১ মাসের chart") and get a
+TradingView-style chart plus a written report. This is analysis software, **not financial advice**.
+
+## What it does
+- Market data from Binance via CCXT, with Bybit/OKX fallback.
+- Deterministic indicators and structure (RSI, MACD, ADX, Supertrend, Ichimoku, liquidity sweeps, FVG, order blocks,
+  volume profile). Gemini only explains the numbers; it does not compute them.
+- Breakout history, backtest (fees, slippage, in/out-of-sample), signal scorecard, multi-timeframe confluence.
+- Price/level alerts, watchlist, scanner, portfolio PnL, futures trade manager, daily market report.
+- Free / Pro / Admin plans, free trial, referral bonus, manual bKash/Nagad approval flow.
+
+## Layout
+| File | Purpose |
+|---|---|
+| `bot.py` | Telegram handlers, NLU, exchange pool, database, charts, jobs, `main()` |
+| `pro_quant.py` | Indicators, market structure, liquidity, imbalances, volume profile, position size |
+| `pro_features.py` | TTL cache, retest state, explainable score, data quality, event fingerprint |
+| `test_*.py` | pytest suite |
+
+`bot.py` imports the two `pro_*` modules, so there is a single copy of that logic.
+
+## Run locally
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+cp .env.example .env   # fill in the values
+python bot.py
+```
+Tests: `python -m pytest -q`
+
+## Configuration (environment variables)
+Required: `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`. Without `DATABASE_URL` alerts, watchlists and plans are disabled.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | — | PostgreSQL connection string |
+| `ADMIN_USER_IDS` | — | Comma-separated Telegram IDs of admins |
+| `GEMINI_MODEL` | see `bot.py` | Gemini model name |
+| `EXCHANGE_FALLBACKS` | `bybit,okx` | Fallback exchanges after Binance |
+| `BKASH_NUMBER`, `NAGAD_NUMBER` | — | Payment numbers shown on /subscribe |
+| `PRO_30_PRICE`, `PRO_90_PRICE` | `Contact admin` | Plan prices |
+| `ADMIN_CONTACT_NAME`, `ADMIN_CONTACT_USERNAME` | see `bot.py` | Support contact shown to users |
+| `PRICE_ALERT_CHANNEL_ID`, `REPORT_CHANNEL_ID` | — | Channels for price cards / daily report |
+| `PRICE_CARD_BRAND` | see `bot.py` | Text on price cards |
+| `CANDLE_LIMIT` / `BACKTEST_CANDLES` | 150 / 2000 | Candles per analysis / backtest |
+| `MAX_CONCURRENT_ANALYSES` | 3 | Parallel analyses |
+| `ALERT_INTERVAL_SECONDS` / `LEVEL_ALERT_INTERVAL_SECONDS` | 180 / 30 | Alert polling intervals |
+| `ANALYSES_RETENTION_DAYS` | 30 | Stored analysis retention |
+| `TRIAL_DAYS` / `REFERRAL_BONUS_DAYS` | 3 / 3 | `0` switches the feature off |
+| `DAILY_REPORT_HOUR` | 9 | Asia/Dhaka hour of the daily report |
+| `PORTFOLIO_REFRESH_SECONDS` / `PORTFOLIO_LIVE_MINUTES` | 30 / 30 | Live portfolio screen |
+| `SENTRY_DSN` | — | Optional; also `pip install sentry-sdk` |
+| `LOG_LEVEL` | `INFO` | Logging level |
+
+## Deploy (Railway)
+Set the variables above on the service, add a PostgreSQL plugin for `DATABASE_URL`, and start with `python bot.py`.
+On a start-up crash the bot messages every admin in `ADMIN_USER_IDS`.

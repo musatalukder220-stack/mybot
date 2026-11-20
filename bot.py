@@ -15,6 +15,7 @@ import html
 import math
 import socket
 import tempfile
+import threading
 import time
 import traceback
 import unicodedata
@@ -110,6 +111,11 @@ try:
 except Exception as _import_exc:  # noqa: BLE001 - report, then fail loudly so Railway shows the real error
     report_startup_crash("import", _import_exc)
     raise
+
+# Quant indicators and pro helpers live in their own modules (single source of truth, unit-tested).
+from pro_features import TTLCache, data_quality, event_fingerprint, explainable_score, retest_state  # noqa: E402
+from pro_quant import (_f, add_indicators, imbalances, liquidity, patterns, position_size, snapshot, structure,  # noqa: E402
+                       swings, volume_profile)
 
 load_dotenv()
 logging.basicConfig(
@@ -1230,128 +1236,6 @@ def approx_pages(total: int, page: int) -> int:
 # ==========================================================================
 # Quant indicators and futures position calculator
 # ==========================================================================
-def _f(v: Any, default: float = 0.0) -> float:
-    try:
-        x=float(v); return x if np.isfinite(x) else default
-    except (TypeError, ValueError): return default
-
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    d=df.copy(); o,h,l,c,v=(d[x].astype(float) for x in ("Open","High","Low","Close","Volume"))
-    for n in (9,20,50,100,200): d[f"EMA{n}"]=c.ewm(span=n,adjust=False).mean()
-    for n in (20,50,200): d[f"SMA{n}"]=c.rolling(n).mean()
-    delta=c.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
-    d["RSI"]=100-100/(1+gain/loss.replace(0,np.nan)); rmin=d.RSI.rolling(14).min(); rmax=d.RSI.rolling(14).max()
-    d["STOCH_RSI"]=(d.RSI-rmin)/(rmax-rmin).replace(0,np.nan)*100
-    d["MACD"]=c.ewm(span=12,adjust=False).mean()-c.ewm(span=26,adjust=False).mean(); d["MACD_SIGNAL"]=d.MACD.ewm(span=9,adjust=False).mean()
-    prev=c.shift(); tr=pd.concat([h-l,(h-prev).abs(),(l-prev).abs()],axis=1).max(axis=1); d["ATR"]=tr.ewm(alpha=1/14,adjust=False).mean()
-    up=h.diff(); down=-l.diff(); plus=up.where((up>down)&(up>0),0.0); minus=down.where((down>up)&(down>0),0.0)
-    plus_di=100*plus.ewm(alpha=1/14,adjust=False).mean()/d.ATR; minus_di=100*minus.ewm(alpha=1/14,adjust=False).mean()/d.ATR
-    d["ADX"]=(100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,np.nan)).ewm(alpha=1/14,adjust=False).mean()
-    mid=c.rolling(20).mean(); sd=c.rolling(20).std(); d["BB_MID"]=mid; d["BB_UPPER"]=mid+2*sd; d["BB_LOWER"]=mid-2*sd
-    d["KC_MID"]=d.EMA20; d["KC_UPPER"]=d.EMA20+1.5*d.ATR; d["KC_LOWER"]=d.EMA20-1.5*d.ATR
-    typical=(h+l+c)/3; d["VWAP"]=(typical*v).cumsum()/v.cumsum().replace(0,np.nan)
-    direction=np.sign(c.diff()).fillna(0); d["OBV"]=(direction*v).cumsum(); d["VOL_MA20"]=v.rolling(20).mean()
-    nine_high=h.rolling(9).max(); nine_low=l.rolling(9).min(); d["TENKAN"]=(nine_high+nine_low)/2
-    high26=h.rolling(26).max(); low26=l.rolling(26).min(); d["KIJUN"]=(high26+low26)/2
-    d["ICHI_A"]=(d.TENKAN+d.KIJUN)/2; d["ICHI_B"]=(h.rolling(52).max()+l.rolling(52).min())/2
-    # Supertrend iterative final bands.
-    hl2=(h+l)/2; upper=hl2+3*d.ATR; lower=hl2-3*d.ATR; st=pd.Series(index=d.index,dtype=float); trend=pd.Series(1,index=d.index,dtype=int)
-    for i in range(1,len(d)):
-        if c.iloc[i]>upper.iloc[i-1]: trend.iloc[i]=1
-        elif c.iloc[i]<lower.iloc[i-1]: trend.iloc[i]=-1
-        else: trend.iloc[i]=trend.iloc[i-1]
-        if trend.iloc[i]>0: lower.iloc[i]=max(lower.iloc[i],lower.iloc[i-1]) if np.isfinite(lower.iloc[i-1]) else lower.iloc[i]
-        else: upper.iloc[i]=min(upper.iloc[i],upper.iloc[i-1]) if np.isfinite(upper.iloc[i-1]) else upper.iloc[i]
-        st.iloc[i]=lower.iloc[i] if trend.iloc[i]>0 else upper.iloc[i]
-    d["SUPERTREND"]=st; d["SUPERTREND_DIR"]=trend
-    return d
-
-
-def swings(d: pd.DataFrame, radius: int=2) -> tuple[list[tuple[int,float]],list[tuple[int,float]]]:
-    highs=[]; lows=[]
-    for i in range(radius,len(d)-radius):
-        if d.High.iloc[i]>=d.High.iloc[i-radius:i+radius+1].max(): highs.append((i,float(d.High.iloc[i])))
-        if d.Low.iloc[i]<=d.Low.iloc[i-radius:i+radius+1].min(): lows.append((i,float(d.Low.iloc[i])))
-    return highs,lows
-
-
-def structure(d: pd.DataFrame) -> dict[str,Any]:
-    hs,ls=swings(d); state="RANGE"; labels=[]
-    for points,hi_name,lo_name in ((hs,"HH","LH"),(ls,"HL","LL")):
-        for j in range(1,len(points)):
-            labels.append({"idx":points[j][0],"price":points[j][1],"label":hi_name if points[j][1]>points[j-1][1] else lo_name})
-    if len(hs)>=2 and len(ls)>=2:
-        if hs[-1][1]>hs[-2][1] and ls[-1][1]>ls[-2][1]: state="BULLISH_HH_HL"
-        elif hs[-1][1]<hs[-2][1] and ls[-1][1]<ls[-2][1]: state="BEARISH_LH_LL"
-    close=float(d.Close.iloc[-1]); bos=None; choch=None
-    if hs and close>hs[-1][1]: bos="BULLISH_BOS"; choch="BULLISH_CHOCH" if state.startswith("BEARISH") else None
-    if ls and close<ls[-1][1]: bos="BEARISH_BOS"; choch="BEARISH_CHOCH" if state.startswith("BULLISH") else None
-    return {"state":state,"bos":bos,"choch":choch,"labels":labels[-12:],"swing_highs":hs[-8:],"swing_lows":ls[-8:]}
-
-
-def liquidity(d: pd.DataFrame) -> dict[str,Any]:
-    hs,ls=swings(d); atr=_f(d.ATR.iloc[-1]); tol=max(atr*.2,_f(d.Close.iloc[-1])*.0005); eqh=[]; eql=[]
-    for a,b in zip(hs,hs[1:]):
-        if abs(a[1]-b[1])<=tol: eqh.append({"indices":[a[0],b[0]],"level":(a[1]+b[1])/2})
-    for a,b in zip(ls,ls[1:]):
-        if abs(a[1]-b[1])<=tol: eql.append({"indices":[a[0],b[0]],"level":(a[1]+b[1])/2})
-    sweeps=[]
-    for i in range(1,len(d)):
-        prior_high=float(d.High.iloc[max(0,i-20):i].max()); prior_low=float(d.Low.iloc[max(0,i-20):i].min())
-        if d.High.iloc[i]>prior_high and d.Close.iloc[i]<prior_high: sweeps.append({"idx":i,"type":"HIGH_SWEEP","level":prior_high})
-        if d.Low.iloc[i]<prior_low and d.Close.iloc[i]>prior_low: sweeps.append({"idx":i,"type":"LOW_SWEEP","level":prior_low})
-    return {"equal_highs":eqh[-5:],"equal_lows":eql[-5:],"sweeps":sweeps[-8:]}
-
-
-def imbalances(d: pd.DataFrame) -> dict[str,Any]:
-    fvg=[]
-    for i in range(2,len(d)):
-        if d.Low.iloc[i]>d.High.iloc[i-2]: fvg.append({"idx":i,"type":"BULLISH_FVG","low":float(d.High.iloc[i-2]),"high":float(d.Low.iloc[i]),"mitigated":bool((d.Low.iloc[i+1:]<=d.High.iloc[i-2]).any())})
-        if d.High.iloc[i]<d.Low.iloc[i-2]: fvg.append({"idx":i,"type":"BEARISH_FVG","low":float(d.High.iloc[i]),"high":float(d.Low.iloc[i-2]),"mitigated":bool((d.High.iloc[i+1:]>=d.Low.iloc[i-2]).any())})
-    obs=[]; atr=d.ATR
-    for i in range(1,len(d)):
-        impulse=abs(d.Close.iloc[i]-d.Open.iloc[i])>1.2*atr.iloc[i]
-        if impulse and d.Close.iloc[i]>d.Open.iloc[i] and d.Close.iloc[i-1]<d.Open.iloc[i-1]: obs.append({"idx":i-1,"type":"BULLISH_OB","low":float(d.Low.iloc[i-1]),"high":float(d.High.iloc[i-1])})
-        if impulse and d.Close.iloc[i]<d.Open.iloc[i] and d.Close.iloc[i-1]>d.Open.iloc[i-1]: obs.append({"idx":i-1,"type":"BEARISH_OB","low":float(d.Low.iloc[i-1]),"high":float(d.High.iloc[i-1])})
-    return {"fair_value_gaps":fvg[-10:],"order_blocks":obs[-8:]}
-
-
-def volume_profile(d: pd.DataFrame,bins:int=24) -> dict[str,float]:
-    lo,hi=float(d.Low.min()),float(d.High.max())
-    if hi<=lo:return {"poc":lo,"vah":hi,"val":lo}
-    edges=np.linspace(lo,hi,bins+1); hist=np.zeros(bins)
-    for _,r in d.iterrows():
-        idx=min(bins-1,max(0,int((float((r.High+r.Low+r.Close)/3)-lo)/(hi-lo)*bins))); hist[idx]+=float(r.Volume)
-    centers=(edges[:-1]+edges[1:])/2; poc=float(centers[int(hist.argmax())]); order=np.argsort(hist)[::-1]; chosen=[]; total=hist.sum(); acc=0
-    for idx in order:
-        chosen.append(idx); acc+=hist[idx]
-        if acc>=total*.70:break
-    return {"poc":poc,"vah":float(edges[max(chosen)+1]),"val":float(edges[min(chosen)])}
-
-
-def patterns(d: pd.DataFrame) -> list[dict[str,Any]]:
-    out=[]; r=d.iloc[-1]; p=d.iloc[-2]; body=abs(r.Close-r.Open); rng=max(r.High-r.Low,1e-12); upper=r.High-max(r.Open,r.Close); lower=min(r.Open,r.Close)-r.Low
-    if body/rng<.1: out.append({"name":"DOJI","quality":round((1-body/rng)*100)})
-    if lower>2*body and upper<body: out.append({"name":"HAMMER","quality":75})
-    if upper>2*body and lower<body: out.append({"name":"SHOOTING_STAR","quality":75})
-    if r.Close>r.Open and p.Close<p.Open and r.Open<=p.Close and r.Close>=p.Open: out.append({"name":"BULLISH_ENGULFING","quality":80})
-    if r.Close<r.Open and p.Close>p.Open and r.Open>=p.Close and r.Close<=p.Open: out.append({"name":"BEARISH_ENGULFING","quality":80})
-    return out
-
-
-def snapshot(df:pd.DataFrame)->tuple[pd.DataFrame,dict[str,Any]]:
-    d=add_indicators(df); s=structure(d); liq=liquidity(d); imb=imbalances(d); vp=volume_profile(d.iloc[-100:]); last=d.iloc[-1]
-    snap={"indicators":{"rsi":_f(last.RSI),"stoch_rsi":_f(last.STOCH_RSI),"macd":_f(last.MACD),"macd_signal":_f(last.MACD_SIGNAL),"adx":_f(last.ADX),"atr":_f(last.ATR),"obv":_f(last.OBV),"vwap":_f(last.VWAP),"supertrend":_f(last.SUPERTREND),"supertrend_direction":int(last.SUPERTREND_DIR),"ichimoku_tenkan":_f(last.TENKAN),"ichimoku_kijun":_f(last.KIJUN)},"structure":s,"liquidity":liq,"imbalances":imb,"volume_profile":vp,"patterns":patterns(d),"data":{"candles":len(d),"last_closed_at":d.index[-1].isoformat()}}
-    return d,snap
-
-
-def position_size(capital:float,risk_pct:float,entry:float,stop:float)->dict[str,float]:
-    if min(capital,risk_pct,entry,stop)<=0 or entry==stop: raise ValueError("Invalid positive values")
-    risk_cash=capital*risk_pct/100; units=risk_cash/abs(entry-stop)
-    return {"risk_cash":risk_cash,"units":units,"position_value":units*entry,"stop_distance_pct":abs(entry-stop)/entry*100}
-
-
 def futures_plan(side: str, entry: float, stop: float, targets: list[float], capital: float, risk_pct: float, leverage: float,
                  maint_margin_rate: float = 0.005, taker_fee: float = 0.0005) -> dict[str, Any]:
     """Risk-based USDT-M futures plan (isolated margin approximation).
@@ -1401,74 +1285,6 @@ professional_snapshot = snapshot
 # ==========================================================================
 # Pro features: MTF confluence, futures flow, sentiment, portfolio maths, scorecard, caches
 # ==========================================================================
-class TTLCache:
-    def __init__(self, maxsize:int=512): self.maxsize=maxsize; self._data={}; self._locks={}
-    def get(self,key:str):
-        item=self._data.get(key)
-        if not item:return None
-        expiry,value=item
-        if expiry<=time.monotonic(): self._data.pop(key,None); return None
-        return value
-    def set(self,key:str,value:Any,ttl:float):
-        if len(self._data)>=self.maxsize:
-            for k in sorted(self._data,key=lambda x:self._data[x][0])[:max(1,self.maxsize//10)]: self._data.pop(k,None)
-        self._data[key]=(time.monotonic()+ttl,value)
-    async def get_or_create(self,key:str,ttl:float,factory:Callable[[],Awaitable[Any]]):
-        hit=self.get(key)
-        if hit is not None:return hit
-        lock=self._locks.setdefault(key,asyncio.Lock())
-        async with lock:
-            hit=self.get(key)
-            if hit is not None:return hit
-            value=await factory(); self.set(key,value,ttl); return value
-
-
-def retest_state(df, breakout:dict[str,Any], tolerance_atr:float=.35)->dict[str,Any]:
-    """Classify latest closed candle around a previously derived range trigger."""
-    if len(df)<3:return {"state":"NO_RETEST_DATA"}
-    last=df.iloc[-1]; prev=df.iloc[-2]; atr=float(df.ATR.iloc[-1]); tol=max(atr*tolerance_atr,float(last.Close)*.001)
-    up=float(breakout["bullish_trigger"]); down=float(breakout["bearish_trigger"]); state=breakout["state"]
-    result={"state":"NOT_APPLICABLE","level":None,"distance":None}
-    if state=="BREAKOUT_CONFIRMED" or prev.Close>up:
-        touched=last.Low<=up+tol; held=last.Close>up
-        result={"state":"RETEST_HELD" if touched and held else ("RETEST_FAILED" if last.Close<up-tol else "WAITING_FOR_RETEST"),"level":up,"distance":float(last.Close-up)}
-    elif state=="BREAKDOWN_CONFIRMED" or prev.Close<down:
-        touched=last.High>=down-tol; held=last.Close<down
-        result={"state":"RETEST_HELD" if touched and held else ("RETEST_FAILED" if last.Close>down+tol else "WAITING_FOR_RETEST"),"level":down,"distance":float(last.Close-down)}
-    return result
-
-
-def explainable_score(q:dict[str,Any], higher:dict[str,Any], market:dict[str,Any], external:dict[str,Any])->dict[str,Any]:
-    b=q["breakout"]; bullish={}
-    bullish["structure"]=16 if q["structure"].startswith("bullish") else (5 if q["structure"]=="range" else 0)
-    bullish["momentum"]=13 if q["rsi"]>=50 and q["macd"]>q["macd_signal"] else 5
-    bullish["volume"]=15 if b["volume_ratio"]>=1.5 else (10 if b["volume_ratio"]>=1.1 else 4)
-    bullish["volatility"]=10 if b["squeeze"] else 5
-    bullish["higher_timeframe"]=15 if str(higher.get("structure","")).startswith("bullish") else 5
-    bullish["market_filter"]=12 if market.get("risk_on") else 4
-    funding=external.get("funding_rate"); bullish["futures"]=8 if funding is not None and abs(funding)<.001 else 4
-    bullish["liquidity_risk"]=6 if not q.get("professional",{}).get("liquidity",{}).get("sweeps") else 3
-    total=min(100,sum(bullish.values()))
-    conflicts=[]
-    if q["structure"].startswith("bullish") and q["rsi"]>70:conflicts.append("Bullish structure কিন্তু RSI overbought")
-    if q["macd"]>q["macd_signal"] and b["volume_ratio"]<1:conflicts.append("Momentum bullish কিন্তু volume দুর্বল")
-    if q["structure"].startswith("bullish") and not market.get("risk_on",True):conflicts.append("Coin bullish কিন্তু BTC/ETH filter দুর্বল")
-    return {"bullish_total":total,"bearish_total":100-total,"components":bullish,"conflicts":conflicts}
-
-
-def data_quality(frame_len:int,higher:dict,external:dict,market:dict)->dict[str,Any]:
-    items={"spot_candles":frame_len>=100,"higher_timeframe":higher.get("status")!="unavailable",
-           "futures":external.get("funding_rate") is not None,"news":external.get("news_status")=="live_rss",
-           "btc_eth_filter":bool(market)}
-    score=round(sum(items.values())/len(items)*100)
-    return {"score":score,"sources":items,"label":"High" if score>=80 else ("Moderate" if score>=50 else "Low")}
-
-
-def event_fingerprint(symbol:str,timeframe:str,candle:str,state:str,level:float)->str:
-    raw=json.dumps([symbol,timeframe,candle,state,round(level,10)],separators=(",",":"))
-    return hashlib.sha256(raw.encode()).hexdigest()[:24]
-
-
 # ---------------------------------------------------------------------------
 # Multi-timeframe confluence
 # ---------------------------------------------------------------------------
@@ -2220,6 +2036,7 @@ REPORT_CHANNEL_ID = os.getenv("REPORT_CHANNEL_ID", "").strip() or PRICE_ALERT_CH
 DAILY_REPORT_HOUR = _env_int("DAILY_REPORT_HOUR", 9, 0, 23)   # Asia/Dhaka hour
 SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
 ERROR_THROTTLE = ErrorThrottle(window=600)
+CHART_LOCK = threading.Lock()   # matplotlib.pyplot keeps global figure state: render one chart at a time
 
 SYSTEM_INSTRUCTION = """You are a disciplined crypto technical analyst. Analyze ONLY the data supplied by the application; never invent prices, news or unstated live data. Return clear Bengali analysis. Explain R1/R2/R3, S1/S2/S3, market structure, breakout state, confirmation, invalidation and conditional considerations. Never promise profit. The analysis_bn value must be clean plain text: do not use Markdown, asterisks, hashtags, backticks, tables, HTML, decorative separators or code fences. Use short titled sections, normal line breaks and the bullet character • only. Trendline indices are zero-based candle positions and must be inside the supplied array. Output strictly one JSON object matching the requested schema, with no surrounding commentary."""
 
@@ -3095,6 +2912,14 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
     def chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False) -> io.BytesIO:
         return tv_chart(frame, request, result, overlays)
 
+    @staticmethod
+    async def chart_async(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False) -> io.BytesIO:
+        """Render off the event loop so other users are not blocked; CHART_LOCK keeps pyplot's global state single-threaded."""
+        def work() -> io.BytesIO:
+            with CHART_LOCK:
+                return tv_chart(frame, request, result, overlays)
+        return await asyncio.to_thread(work)
+
 BOT: AnalystBot | None = None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3458,8 +3283,8 @@ async def run_request(update: Update, request: Request) -> None:
             pine=make_pine_script(request.symbol,request.timeframe,frame,result)
             pine_key=f"pine:{update.effective_user.id if update.effective_user else 0}:{request.symbol}:{request.timeframe}"
             BOT.cache.set(pine_key,pine,ttl=86400)
-            # Matplotlib is CPU-bound and not thread-safe; render promptly in event thread.
-            image = BOT.chart(frame, request, result)
+            # Matplotlib is CPU-bound: render in a worker thread (serialised by CHART_LOCK) so the event loop stays free.
+            image = await BOT.chart_async(frame, request, result)
             if uid is not None: BOT.cache.set(f"chartctx:{uid}:{request.symbol}:{request.timeframe}", (frame, request, result), ttl=3600)   # for the Smart zones button
         bo = result["quant"]["breakout"]
         state_text=colored_state(bo['state'],bengali=(lang=="bn"))
@@ -3665,9 +3490,9 @@ async def market_cap_answer(message: Message,text: str,symbol: str | None = None
         # Dominance itself is a current global market-cap share. Free CoinGecko
         # does not provide reliable arbitrary-coin dominance candles, so the
         # accompanying S/R chart truthfully uses Binance price candles.
-        frame=await BOT.fetch_candles(Request(req.symbol,"4h")); q=quant_snapshot(frame)
+        frame=await BOT.fetch_candles(Request(req.symbol,"4h")); q=await asyncio.to_thread(quant_snapshot,frame)
         chart_result={"supports":[z["price"] for z in q["supports"]],"resistances":[z["price"] for z in q["resistances"]],"trendlines":q["trendlines"],"quant":q}
-        image=BOT.chart(frame,Request(req.symbol,"4h"),chart_result)
+        image=await BOT.chart_async(frame,Request(req.symbol,"4h"),chart_result)
         caption=f"{row.get('name',ticker.upper())} ({ticker.upper()})\nCurrent global dominance: {dom_text}\nMarket cap: ${cap:,.0f}\nRank: #{rank}\nPrice: ${float(price):,.8g}\n\nChart: Binance 4H price support/resistance; dominance historical chart নয়।"
         await message.reply_photo(photo=image,caption=caption)
     except UserInputError as exc: await message.reply_text(f"⚠️ {exc}")
@@ -3898,7 +3723,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             symbol,tf=BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2]); stored=BOT.cache.get(f"chartctx:{update.effective_user.id}:{symbol}:{tf}")
             if not stored: await q.answer("Chart-এর তথ্য পুরনো হয়ে গেছে — Refresh চাপুন।",show_alert=True); return
             on=parts[3]=="1"; frame,request,result=stored
-            image=BOT.chart(frame,request,result,overlays=on)
+            image=await BOT.chart_async(frame,request,result,overlays=on)
             try: await q.message.edit_media(media=InputMediaPhoto(media=image,caption=q.message.caption),reply_markup=analysis_keyboard(symbol,tf,overlays=on))
             except BadRequest as exc:
                 if "not modified" not in str(exc).lower(): raise
@@ -4589,7 +4414,7 @@ async def channel_price_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             change=float(ticker.get('percentage') or 0); candles,_=await BOT.pool.call('fetch_ohlcv',symbol,"15m",limit=10)
             base=symbol.split('/')[0]; common={"BTC":"Bitcoin","ETH":"Ethereum","BNB":"BNB","SOL":"Solana","DOGE":"Dogecoin","XRP":"XRP","ADA":"Cardano","SUI":"Sui","TRX":"TRON"}; name=common.get(base,base)
             logo=await fetch_coin_logo(symbol)
-            card=make_price_card(symbol,name,price,change,candles,logo_bytes=logo)
+            card=await asyncio.to_thread(make_price_card,symbol,name,price,change,candles,logo_bytes=logo)
             price_text=f"${price:.8f}".rstrip('0').rstrip('.')
             if price>=100: price_text=f"${price:.2f}"
             price_tag=f"@{base.lower()}_price"
