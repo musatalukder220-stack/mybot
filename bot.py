@@ -1942,6 +1942,7 @@ TV_SUPPORT, TV_RESIST, TV_TRIG_UP, TV_TRIG_DOWN = _T["support"], _T["resist"], _
 TV_EMA = _T["ema"]
 TV_GOLD, TV_GREY, TV_BLUE = _T["gold"], _T["grey"], _T["blue"]
 TV_W, TV_H, TV_TIME_H, TV_TAG_H = 1280, 800, 34, 19          # picture size and fixed pixel bands (time axis, price tag height)
+TV_TAG_PAD, TV_AXIS_MARGIN = 8, 12                           # px: padding inside a price tag, gap between the tags and the picture's right edge
 TV_HEAD_FRAC, TV_VOL_FRAC = .17, .13                          # share of the plot kept free for the header (top) and the volume band (bottom)
 _TV_FONT_PATHS: dict[str, str] = {}
 
@@ -2051,7 +2052,9 @@ def compact_num(v: float) -> str:
 
 def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False) -> io.BytesIO:
     """TradingView-desktop-look picture, 1280x800 (inside Telegram's photo limit, so it is shown 1:1 and not re-scaled)."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
     from matplotlib.patches import Rectangle as Rect
     from matplotlib.ticker import MaxNLocator
@@ -2074,13 +2077,24 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
         if bo.get(key): items.append({"text": f"{name}  {money(float(bo[key]))}", "y": float(bo[key]), "color": color})
     items = [it for it in items if lo - .35 * span <= it["y"] <= hi + .35 * span]       # far-away levels stay in the written report, not the picture
     last = float(c[-1]); last_color = TV_UP if up[-1] else TV_DOWN
-    longest = max([len(it["text"]) for it in items] + [len(money(last)), 8])
-    axis_w = min(210.0, max(78.0, 8.6 * longest + 18))                         # the price column, like TradingView's
-    plot_w, plot_h = TV_W - axis_w, TV_H - TV_TIME_H
+    plot_h = TV_H - TV_TIME_H
     ys = [lo, hi] + [it["y"] for it in items]
     data_lo = min(ys); data_hi = max(ys) + span * .03
     total = (data_hi - data_lo) / (1 - TV_HEAD_FRAC - TV_VOL_FRAC)             # header strip on top, volume band underneath, candles in between
     ymin = data_lo - total * TV_VOL_FRAC; ymax = data_hi + total * TV_HEAD_FRAC
+    px_y = (ymax - ymin) / plot_h                                              # price per pixel
+    edge = 14 * px_y                                                            # a label closer than this to the picture's edge would be cut off
+    price_ticks = [t for t in MaxNLocator(nbins=10, steps=[1, 2, 2.5, 5, 10]).tick_values(ymin, ymax) if ymin + edge < t < ymax - edge]
+    tick_dec = max(dec if (price_ticks[1] - price_ticks[0] if len(price_ticks) > 1 else 1) < 10 else 2, 0)
+    # The price column is sized from the measured pixel width of its widest text (tags and tick numbers), plus padding and a gap
+    # before the picture's right edge - so the tags hug their text like TradingView's instead of stretching to the edge.
+    probe = Figure(dpi=100); probe_renderer = FigureCanvasAgg(probe).get_renderer()
+    text_w = lambda txt, prop: probe.text(0, 0, txt, fontproperties=prop).get_window_extent(probe_renderer).width
+    tag_font, tick_font = tv_font("semibold", 8.6), tv_font("regular", 8.6)
+    widest = max([text_w(it["text"], tag_font) for it in items] + [text_w(money(last), tag_font)] + [text_w(f"{t:,.{tick_dec}f}", tick_font) for t in price_ticks])
+    tag_w = math.ceil(widest) + 2 * TV_TAG_PAD
+    axis_w = tag_w + TV_AXIS_MARGIN                                            # the price column, like TradingView's
+    plot_w = TV_W - axis_w
     right_pad = max(6, round(n * .08))
     xlim = (-1.5, n - 1 + right_pad)
 
@@ -2095,14 +2109,11 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
     ax.set_ylim(ymin, ymax); axv.set_ylim(0, max(float(vol.max()), 1e-12) / (TV_VOL_FRAC * .8))
     for side in ax.spines.values(): side.set_visible(False)
     ax.tick_params(length=0)
-    px_y = (ymax - ymin) / plot_h                                              # price per pixel
     to_axes = blended_transform_factory(ax.transAxes, ax.transData)
     keep = Rect((xlim[0], ymin), xlim[1] - xlim[0], ymax - total * TV_HEAD_FRAC * .9 - ymin, transform=ax.transData)   # lines that run off the top stop below the header text
     time_ticks = tv_time_ticks(view.index, request.timeframe, plot_w, right_pad)
 
     # background furniture: faint grid, big symbol watermark, volume histogram
-    edge = 14 * px_y                                                            # a label closer than this to the picture's edge would be cut off
-    price_ticks = [t for t in MaxNLocator(nbins=10, steps=[1, 2, 2.5, 5, 10]).tick_values(ymin, ymax) if ymin + edge < t < ymax - edge]
     if _T["grid"]:
         for t in price_ticks: ax.axhline(t, color=_T["grid"], linewidth=.8, zorder=.5)
         for pos, _label, _bold in time_ticks: ax.axvline(pos, color=_T["grid"], linewidth=.8, zorder=.5)
@@ -2138,14 +2149,13 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
     gap = TV_TAG_H * px_y
     tags = items + [{"text": money(last), "y": last, "color": last_color, "last": True}]
     shown = spread_tags([t["y"] for t in tags], gap, ymin + gap / 2, ymax - gap / 2)
-    tick_dec = max(dec if (price_ticks[1] - price_ticks[0] if len(price_ticks) > 1 else 1) < 10 else 2, 0)
     for t in price_ticks:
         if any(abs(t - s) < gap * .85 for s in shown): continue
-        ax.text(1.0, t, f"{t:,.{tick_dec}f}", transform=to_axes, ha="left", va="center", color=TV_TEXT, alpha=.85, fontproperties=tv_font("regular", 8.6), clip_on=False,
-                bbox={"pad": 0, "facecolor": "none", "edgecolor": "none"}).set_x(1.0 + 9 / plot_w)
+        ax.text(1.0, t, f"{t:,.{tick_dec}f}", transform=to_axes, ha="left", va="center", color=TV_TEXT, alpha=.85, fontproperties=tick_font, clip_on=False,
+                bbox={"pad": 0, "facecolor": "none", "edgecolor": "none"}).set_x(1.0 + TV_TAG_PAD / plot_w)
     for tag, y in sorted(zip(tags, shown), key=lambda p: bool(p[0].get("last"))):
-        ax.add_patch(Rect((1.0, y - gap / 2), axis_w / plot_w, gap, transform=to_axes, facecolor=tag["color"], edgecolor="none", clip_on=False, zorder=20))
-        ax.text(1.0 + 9 / plot_w, y, tag["text"], transform=to_axes, ha="left", va="center", color="white", fontproperties=tv_font("semibold", 8.6), clip_on=False, zorder=21)
+        ax.add_patch(Rect((1.0, y - gap / 2), tag_w / plot_w, gap, transform=to_axes, facecolor=tag["color"], edgecolor="none", clip_on=False, zorder=20))
+        ax.text(1.0 + TV_TAG_PAD / plot_w, y, tag["text"], transform=to_axes, ha="left", va="center", color="white", fontproperties=tag_font, clip_on=False, zorder=21)
 
     # time scale at the bottom: round times, bold day/month/year changes
     band = fig.add_axes([0, 0, plot_w / TV_W, TV_TIME_H / TV_H]); band.patch.set_visible(False); band.set_xlim(*xlim); band.axis("off"); band.set_zorder(2)
