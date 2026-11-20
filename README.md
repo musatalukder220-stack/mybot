@@ -44,6 +44,7 @@ Required: `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`. Without `DATABASE_URL` alerts,
 | `ADMIN_CONTACT_NAME`, `ADMIN_CONTACT_USERNAME` | see `bot.py` | Support contact shown to users |
 | `PRICE_ALERT_CHANNEL_ID`, `REPORT_CHANNEL_ID` | — | Channels for price cards / daily report |
 | `PRICE_CARD_BRAND` | see `bot.py` | Text on price cards |
+| `CHART_THEME` | `dark` | Default chart theme for everyone: `dark` or `paper` (pale yellow). Each user can override it with the 🌙 / 🟡 buttons in /settings |
 | `CANDLE_LIMIT` / `BACKTEST_CANDLES` | 150 / 2000 | Candles per analysis / backtest |
 | `MAX_CONCURRENT_ANALYSES` | 3 | Parallel analyses |
 | `ALERT_INTERVAL_SECONDS` / `LEVEL_ALERT_INTERVAL_SECONDS` | 180 / 30 | Alert polling intervals |

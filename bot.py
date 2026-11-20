@@ -1649,10 +1649,11 @@ def _in_range(price: float, lo: float, hi: float) -> bool:
 
 
 def draw_overlays(ax: Any, view: pd.DataFrame, professional: dict[str, Any] | None, offset: int = 0, *,
-                  max_fvg: int = 4, max_ob: int = 3, max_sweeps: int = 4, show_vwap: bool = True, show_profile: bool = True, tv: bool = False) -> dict[str, int]:
+                  max_fvg: int = 4, max_ob: int = 3, max_sweeps: int = 4, show_vwap: bool = True, show_profile: bool = True, tv: bool = False, theme: dict[str, Any] | None = None) -> dict[str, int]:
     """Draw overlays on ``ax`` and return how many items of each kind were drawn. ``tv`` = the quieter TradingView-style look."""
-    gold, grey, blue = (TV_GOLD, TV_GREY, TV_BLUE) if tv else (GOLD, GREY, BLUE)         # inks follow the chart theme
-    note = {"fontproperties": tv_font("semibold", 7.4), "zorder": 7, "bbox": {"boxstyle": "round,pad=0.12", "facecolor": TV_BG, "edgecolor": "none", "alpha": .8}} if tv else {"fontsize": 6.5}
+    th = theme or _T
+    gold, grey, blue = (th["gold"], th["grey"], th["blue"]) if tv else (GOLD, GREY, BLUE)         # inks follow the chart theme
+    note = {"fontproperties": tv_font("semibold", 7.4), "zorder": 7, "bbox": {"boxstyle": "round,pad=0.12", "facecolor": th["bg"], "edgecolor": "none", "alpha": .8}} if tv else {"fontsize": 6.5}
     drawn = {"fvg": 0, "order_blocks": 0, "sweeps": 0, "equal_levels": 0, "profile": 0, "vwap": 0}
     n = len(view)
     if n < 5:
@@ -1715,13 +1716,14 @@ def draw_overlays(ax: Any, view: pd.DataFrame, professional: dict[str, Any] | No
     return drawn
 
 
-def legend_entries(drawn: dict[str, int], tv: bool = False) -> list[tuple[str, str, str]]:
+def legend_entries(drawn: dict[str, int], tv: bool = False, theme: dict[str, Any] | None = None) -> list[tuple[str, str, str]]:
     """(label, color, linestyle) triples for the items that were actually drawn."""
+    th = theme or _T
     out = []
     if drawn.get("vwap"):
-        out.append(("VWAP", TV_BLUE if tv else BLUE, "-."))
+        out.append(("VWAP", th["blue"] if tv else BLUE, "-."))
     if drawn.get("profile"):
-        out.append(("POC/VAH/VAL", TV_GOLD if tv else GOLD, "-"))
+        out.append(("POC/VAH/VAL", th["gold"] if tv else GOLD, "-"))
     if drawn.get("fvg"):
         out.append(("FVG", GREEN, ":"))
     if drawn.get("order_blocks"):
@@ -1749,6 +1751,7 @@ CHART_THEMES: dict[str, dict[str, Any]] = {
         "gold": "#d97706", "grey": "#5d606b", "blue": "#1e88e5", "zone_alpha": .14, "vol_alpha": .4, "watermark_alpha": .06, "level_alpha": 1.0,
     },
 }
+CHART_THEME_LABELS = {"dark": "Dark", "paper": "Yellow"}
 CHART_THEME = os.getenv("CHART_THEME", "dark").strip().lower()
 if CHART_THEME not in CHART_THEMES: CHART_THEME = "dark"
 _T = CHART_THEMES[CHART_THEME]
@@ -1866,8 +1869,19 @@ def compact_num(v: float) -> str:
     return f"{v:.2f}"
 
 
-def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False) -> io.BytesIO:
-    """TradingView-desktop-look picture, 1280x800 (inside Telegram's photo limit, so it is shown 1:1 and not re-scaled)."""
+def chart_theme_name(theme: str | None) -> str:
+    """A known theme name, else the server default (CHART_THEME)."""
+    return theme if theme in CHART_THEMES else CHART_THEME
+
+
+def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False, theme: str | None = None) -> io.BytesIO:
+    """TradingView-desktop-look picture, 1280x800 (inside Telegram's photo limit, so it is shown 1:1 and not re-scaled).
+    ``theme`` is "dark" or "paper"; anything else falls back to the CHART_THEME default."""
+    _T = CHART_THEMES[chart_theme_name(theme)]           # shadows the module default: every colour below follows this render's theme
+    TV_BG, TV_TEXT, TV_MUTED, TV_FAINT = _T["bg"], _T["text"], _T["muted"], _T["faint"]
+    TV_UP, TV_DOWN = _T["up"], _T["down"]
+    TV_SUPPORT, TV_RESIST, TV_TRIG_UP, TV_TRIG_DOWN = _T["support"], _T["resist"], _T["trig_up"], _T["trig_down"]
+    TV_EMA = _T["ema"]
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.colors import LinearSegmentedColormap
     from matplotlib.figure import Figure
@@ -1958,7 +1972,7 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
         y0, y1 = line["start_val"], line["end_val"]
         if x0 < 0: y0, x0 = y0 + (y1 - y0) * (0 - x0) / (x1 - x0), 0
         ax.plot([x0, x1], [y0, y1], color=_T["trend"], linewidth=1.5, linestyle=(0, (5, 3)), zorder=6)[0].set_clip_path(keep)
-    drawn = draw_overlays(ax, view, (result.get("quant") or {}).get("professional"), offset, tv=True) if overlays else {}
+    drawn = draw_overlays(ax, view, (result.get("quant") or {}).get("professional"), offset, tv=True, theme=_T) if overlays else {}
 
     # price scale: numbers at the right, tags drawn flush against the plot; a tick that a tag would cover is left out
     ax.set_yticks([]); ax.set_xticks([])
@@ -1996,7 +2010,7 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
     extras: list[tuple[str, str, Any]] = []
     for name, col, color in TV_EMA:
         if col in view.columns and pd.notna(view[col].iloc[-1]): extras += [(f"{name}  ", TV_MUTED, tv_font("regular", 8.8)), (money(float(view[col].iloc[-1])) + "    ", color, tv_font("regular", 8.8))]
-    for label, color, _style in legend_entries(drawn, tv=True): extras.append((f"{label}    ", color, tv_font("semibold", 8.8)))
+    for label, color, _style in legend_entries(drawn, tv=True, theme=_T): extras.append((f"{label}    ", color, tv_font("semibold", 8.8)))
     flow(46, extras)
     flow(68, [("Volume  ", TV_MUTED, tv_font("regular", 8.8)), (compact_num(float(vol[-1])) + "    ", last_color, tv_font("regular", 8.8))]
          + ([("Avg 20  ", TV_MUTED, tv_font("regular", 8.8)), (compact_num(float(np.mean(vol[-20:]))), TV_FAINT, tv_font("regular", 8.8))] if n >= 5 else []))
@@ -2459,6 +2473,7 @@ class AnalystBot:
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS risk_mode TEXT NOT NULL DEFAULT 'balanced'")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Asia/Dhaka'")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'bn'")
+            await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS chart_theme TEXT NOT NULL DEFAULT ''")   # '' = server default (CHART_THEME)
             await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target2 DOUBLE PRECISION")
             await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target3 DOUBLE PRECISION")
             await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp1_hit BOOLEAN NOT NULL DEFAULT FALSE")
@@ -2524,9 +2539,9 @@ class AnalystBot:
         if delivered: await self.db.execute("UPDATE users SET admin_notified=TRUE WHERE telegram_id=$1",u.id)
 
     async def user_settings(self, user_id: int | None) -> dict[str,str]:
-        defaults={"detail_mode":"standard","risk_mode":"balanced","timezone":"Asia/Dhaka","language":"bn"}
+        defaults={"detail_mode":"standard","risk_mode":"balanced","timezone":"Asia/Dhaka","language":"bn","chart_theme":""}
         if not self.db or not user_id: return defaults
-        row=await self.db.fetchrow("SELECT detail_mode,risk_mode,timezone,language FROM users WHERE telegram_id=$1",user_id)
+        row=await self.db.fetchrow("SELECT detail_mode,risk_mode,timezone,language,chart_theme FROM users WHERE telegram_id=$1",user_id)
         return dict(row) if row else defaults
 
     async def close(self) -> None:
@@ -2976,15 +2991,15 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
                 "external_context": context, "higher_timeframe": higher, "market_filter": market}
 
     @staticmethod
-    def chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False) -> io.BytesIO:
-        return tv_chart(frame, request, result, overlays)
+    def chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False, theme: str | None = None) -> io.BytesIO:
+        return tv_chart(frame, request, result, overlays, theme)
 
     @staticmethod
-    async def chart_async(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False) -> io.BytesIO:
+    async def chart_async(frame: pd.DataFrame, request: Request, result: dict[str, Any], overlays: bool = False, theme: str | None = None) -> io.BytesIO:
         """Render off the event loop so other users are not blocked; CHART_LOCK keeps pyplot's global state single-threaded."""
         def work() -> io.BytesIO:
             with CHART_LOCK:
-                return tv_chart(frame, request, result, overlays)
+                return tv_chart(frame, request, result, overlays, theme)
         return await asyncio.to_thread(work)
 
 BOT: AnalystBot | None = None
@@ -3067,7 +3082,7 @@ GUIDE_DETAILS={
  "refresh":"Chart-এর Refresh button একই coin/timeframe-এর সর্বশেষ closed data দিয়ে analysis আবার চালায়।",
  "chart_tf":"1H, 4H ও 1D button একই coin-কে অন্য timeframe-এ সঙ্গে সঙ্গে বিশ্লেষণ করে।",
  "history":"Chart-এর History button সাম্প্রতিক confirmed/false breakout events ও levels দেখায়।",
- "chart_settings":"Settings button থেকে report detail, Aggressive/Balanced/Conservative confirmation এবং language নির্বাচন করুন।",
+ "chart_settings":"Settings button থেকে report detail, Aggressive/Balanced/Conservative confirmation, language এবং চার্টের থিম (Dark/Yellow) নির্বাচন করুন।",
  "scanner":"/scanner 4h top-volume USDT markets scan করে সম্ভাব্য breakout candidates rank করে। Score probability নয়।",
  "events_help":"Text-এ BTC news বা সব crypto news লিখলে multiple free RSS source-এর সর্বশেষ headline, সংক্ষিপ্ত মূল কথা, source link ও market hint দেখাবে। Scheduled event feature সরানো হয়েছে।",
  "backtest":"/backtest BTC 4h historical rules test করে। ফল ভবিষ্যৎ লাভের নিশ্চয়তা নয় এবং fees/slippage assumptions পড়তে হবে।",
@@ -3225,6 +3240,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Quick",callback_data="set|detail_mode|quick"),InlineKeyboardButton("Standard",callback_data="set|detail_mode|standard"),InlineKeyboardButton("Professional",callback_data="set|detail_mode|professional")],
         [InlineKeyboardButton("Aggressive",callback_data="set|risk_mode|aggressive"),InlineKeyboardButton("Balanced",callback_data="set|risk_mode|balanced"),InlineKeyboardButton("Conservative",callback_data="set|risk_mode|conservative")],
         [InlineKeyboardButton("বাংলা",callback_data="set|language|bn"),InlineKeyboardButton("English",callback_data="set|language|en")],
+        [InlineKeyboardButton("🌙 Dark chart",callback_data="set|chart_theme|dark"),InlineKeyboardButton("🟡 Yellow chart",callback_data="set|chart_theme|paper")],
     ])
 
 
@@ -3351,7 +3367,7 @@ async def run_request(update: Update, request: Request) -> None:
             pine_key=f"pine:{update.effective_user.id if update.effective_user else 0}:{request.symbol}:{request.timeframe}"
             BOT.cache.set(pine_key,pine,ttl=86400)
             # Matplotlib is CPU-bound: render in a worker thread (serialised by CHART_LOCK) so the event loop stays free.
-            image = await BOT.chart_async(frame, request, result)
+            image = await BOT.chart_async(frame, request, result, theme=settings.get("chart_theme"))
             if uid is not None: BOT.cache.set(f"chartctx:{uid}:{request.symbol}:{request.timeframe}", (frame, request, result), ttl=3600)   # for the Smart zones button
         bo = result["quant"]["breakout"]
         state_text=colored_state(bo['state'],bengali=(lang=="bn"))
@@ -3559,7 +3575,7 @@ async def market_cap_answer(message: Message,text: str,symbol: str | None = None
         # accompanying S/R chart truthfully uses Binance price candles.
         frame=await BOT.fetch_candles(Request(req.symbol,"4h")); q=await asyncio.to_thread(quant_snapshot,frame)
         chart_result={"supports":[z["price"] for z in q["supports"]],"resistances":[z["price"] for z in q["resistances"]],"trendlines":q["trendlines"],"quant":q}
-        image=await BOT.chart_async(frame,Request(req.symbol,"4h"),chart_result)
+        image=await BOT.chart_async(frame,Request(req.symbol,"4h"),chart_result,theme=(await BOT.user_settings(message.from_user.id if message.from_user else None)).get("chart_theme"))
         caption=f"{row.get('name',ticker.upper())} ({ticker.upper()})\nCurrent global dominance: {dom_text}\nMarket cap: ${cap:,.0f}\nRank: #{rank}\nPrice: ${float(price):,.8g}\n\nChart: Binance 4H price support/resistance; dominance historical chart নয়।"
         await message.reply_photo(photo=image,caption=caption)
     except UserInputError as exc: await message.reply_text(f"⚠️ {exc}")
@@ -3597,8 +3613,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await BOT.ensure_user(update)
     current="Default: Standard report, Balanced confirmation, বাংলা, Asia/Dhaka"
     if BOT.db and update.effective_user:
-        row=await BOT.db.fetchrow("SELECT detail_mode,risk_mode,language,timezone FROM users WHERE telegram_id=$1",update.effective_user.id)
-        if row: current=f"Report: {row['detail_mode']}\nConfirmation: {row['risk_mode']}\nLanguage: {row['language']}\nTimezone: {row['timezone']}"
+        row=await BOT.db.fetchrow("SELECT detail_mode,risk_mode,language,timezone,chart_theme FROM users WHERE telegram_id=$1",update.effective_user.id)
+        if row: current=f"Report: {row['detail_mode']}\nConfirmation: {row['risk_mode']}\nLanguage: {row['language']}\nTimezone: {row['timezone']}\nChart: {CHART_THEME_LABELS[chart_theme_name(row['chart_theme'])]}"
     await update.effective_message.reply_text("Settings\n\n"+current,reply_markup=settings_keyboard())
 
 
@@ -3790,7 +3806,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             symbol,tf=BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2]); stored=BOT.cache.get(f"chartctx:{update.effective_user.id}:{symbol}:{tf}")
             if not stored: await q.answer("Chart-এর তথ্য পুরনো হয়ে গেছে — Refresh চাপুন।",show_alert=True); return
             on=parts[3]=="1"; frame,request,result=stored
-            image=await BOT.chart_async(frame,request,result,overlays=on)
+            image=await BOT.chart_async(frame,request,result,overlays=on,theme=(await BOT.user_settings(update.effective_user.id)).get("chart_theme"))
             try: await q.message.edit_media(media=InputMediaPhoto(media=image,caption=q.message.caption),reply_markup=analysis_keyboard(symbol,tf,overlays=on))
             except BadRequest as exc:
                 if "not modified" not in str(exc).lower(): raise
@@ -3913,15 +3929,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         if parts[0]=="set" and len(parts)==3:
             if not BOT.db: await q.message.reply_text("Settings save করতে DATABASE_URL প্রয়োজন।"); return
-            allowed={"detail_mode":{"quick","standard","professional"},"risk_mode":{"aggressive","balanced","conservative"},"language":{"bn","en"}}
+            allowed={"detail_mode":{"quick","standard","professional"},"risk_mode":{"aggressive","balanced","conservative"},"language":{"bn","en"},"chart_theme":{"dark","paper"}}
             field,value=parts[1],parts[2]
             if field not in allowed or value not in allowed[field]: return
             if field=="detail_mode" and value=="professional" and await BOT.effective_plan(update.effective_user.id) not in {"pro","admin"}:
                 await q.message.reply_text("Professional report Pro feature। বিস্তারিত জানতে /subscribe পাঠান।"); return
             await BOT.ensure_user(update)
             await BOT.db.execute(f"UPDATE users SET {field}=$1 WHERE telegram_id=$2",value,update.effective_user.id)
-            field_bn={"detail_mode":"Report mode","risk_mode":"Confirmation mode","language":"Language"}.get(field,field)
-            await q.message.reply_text(f"✅ {field_bn} পরিবর্তন হয়েছে: {value.title()}"); return
+            field_bn={"detail_mode":"Report mode","risk_mode":"Confirmation mode","language":"Language","chart_theme":"Chart theme"}.get(field,field)
+            shown=CHART_THEME_LABELS[value] if field=="chart_theme" else value.title()
+            await q.message.reply_text(f"✅ {field_bn} পরিবর্তন হয়েছে: {shown}"+(" — পরের চার্ট থেকে কার্যকর হবে।" if field=="chart_theme" else "")); return
     except UserInputError as exc: await q.message.reply_text(f"⚠️ {exc}")
     except Exception: log.exception("Callback failed"); await q.message.reply_text("এই action সম্পন্ন করা যায়নি।")
 
