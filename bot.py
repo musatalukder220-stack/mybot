@@ -5709,7 +5709,7 @@ async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await BOT.ensure_user(update); uid = update.effective_user.id
     rendered = await portfolio_render(uid, 0)
     if rendered is None:
-        await msg.reply_text("💼 Portfolio খালি। কিনলে নিচের Buy চাপুন (বা লিখুন: /buy ETH 0.5 2000)।", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟢 Buy", callback_data="pf|buy")]])); return
+        await msg.reply_text("💼 Portfolio খালি। কিনলে নিচের Buy চাপুন (বা লিখুন: /buy ETH 0.5 2000 অথবা /buy ETH 500 usd)।", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟢 Buy", callback_data="pf|buy")]])); return
     image, caption, keyboard, _ = rendered
     old = PF_VIEWS.pop(uid, None)
     sent = await msg.reply_photo(photo=image, caption=caption, reply_markup=keyboard)
@@ -5745,9 +5745,9 @@ async def portfolio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
     q = update.callback_query; uid = update.effective_user.id
     if parts[1] in {"buy", "sell"}:
         if parts[1] == "buy":
-            sent = await q.message.reply_text("🟢 কী কিনেছেন? লিখুন: coin, পরিমাণ, দাম\nউদাহরণ: ETH 0.5 2000\n(দাম না দিলে এখনকার দাম ধরব। নগদ USDT যোগ করতে: USDT 100)\nবাতিল করতে: cancel")
+            sent = await q.message.reply_text(trade_prompt("buy"))
         else:
-            sent = await q.message.reply_text("🔴 কী বিক্রি করেছেন? লিখুন: coin, পরিমাণ, দাম\nউদাহরণ: ETH 0.2 2100\n(সব বিক্রি করলে: ETH all)\nবাতিল করতে: cancel")
+            sent = await q.message.reply_text(trade_prompt("sell"))
         for old_prompt in context.user_data.get("pf_pending", {}).get("msgs", []): schedule_delete(context.bot, [old_prompt], 0)
         context.user_data["pf_pending"] = {"side": parts[1], "at": time.time(), "msgs": [msg_ref(update, sent)]}
         return
@@ -5769,38 +5769,90 @@ CANCEL_WORDS = {"cancel", "বাতিল", "batil", "stop"}
 ALL_WORDS = {"all", "sob", "সব", "সবটা", "full"}
 
 
+_MONEY_NUM = r"\d+(?:\.\d+)?|\.\d+"
+_MONEY_CUR = r"(?:\$|usdt|usd|dollars?|bucks?|ডলার[\u0980-\u09ff]*)"
+_MONEY_AFTER = re.compile(rf"(?P<num>{_MONEY_NUM})\s*(?P<cur>{_MONEY_CUR})(?![a-z])")      # 500 usd, 500$, 500 ডলার
+_MONEY_BEFORE = re.compile(rf"\$\s*(?P<num>{_MONEY_NUM})")                                  # $500
+
+
+def split_money(text: str) -> tuple[str, float | None, str | None]:
+    """Find a dollar amount that is the FIRST number written ('ETH 500 usd', 'eth $500', '500 ডলারের eth').
+    Returns (text without that amount and without any other currency decoration, dollars | None, the currency word).
+    'ETH 0.5 2000 usd' is not a dollar amount: the first number (0.5) is the quantity and 'usd' only decorates the price."""
+    raw = _nfc(text or "").translate(_ZERO_WIDTH).translate(_BN_DIGITS).lower()
+    raw = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", raw)
+    first = re.search(_MONEY_NUM, raw)
+    marked = None
+    if first:
+        for m in list(_MONEY_AFTER.finditer(raw)) + list(_MONEY_BEFORE.finditer(raw)):
+            if m.start("num") == first.start(): marked = m; break
+    def strip_decor(t: str) -> str: return _MONEY_AFTER.sub(lambda m: m.group("num"), _MONEY_BEFORE.sub(lambda m: m.group("num"), t))
+    if not marked: return strip_decor(raw), None, None
+    cur = marked.group("cur") if "cur" in marked.groupdict() else "$"
+    start, end = marked.start(), marked.end()
+    return strip_decor(raw[:start] + " " + raw[end:]), float(marked.group("num")), cur
+
+
+def trade_prompt(side: str) -> str:
+    """What the bot asks after Buy / Sell: both ways of writing an amount, each with an example."""
+    buy = side == "buy"
+    coin_example, usd_example = ("ETH 0.5 2000", "ETH 500 usd") if buy else ("ETH 0.2 2100", "ETH 200 usd")
+    qty_note, usd_note = ("০.৫ ETH কিনেছেন, প্রতিটির দাম 2000", "এখনকার দামে ৫০০ ডলারের ETH কিনেছেন") if buy else ("০.২ ETH বিক্রি করেছেন, প্রতিটির দাম 2100", "এখনকার দামে ২০০ ডলারের ETH বিক্রি করেছেন")
+    return (f"{'🟢 কী কিনেছেন?' if buy else '🔴 কী বিক্রি করেছেন?'}\n\n"
+            f"① কয়েনের পরিমাণ দিয়ে:\n   {coin_example}\n   ({qty_note}। দাম না দিলে এখনকার দাম ধরব)\n\n"
+            f"② ডলার (USDT) দিয়ে: পরিমাণের পরে usd লিখুন\n   {usd_example}\n   ({usd_note} — কত ETH হলো আমি হিসাব করে নেব)\n   নিজের দামে: {usd_example} {'2000' if buy else '2100'}\n\n"
+            + ("নগদ USDT যোগ করতে: USDT 100\n" if buy else "সব বিক্রি করলে: ETH all\n") + "বাতিল করতে: cancel")
+
+
 def parse_trade_text(text: str, known: set[str]) -> dict[str, Any]:
-    """'ETH 0.5 2000', 'bought 0.5 eth at 2000', 'USDT 100', 'eth all' -> {symbol, qty|None (all), price|None}. Raises ValueError with a helpful message."""
-    clean = normalize(text)
+    """'ETH 0.5 2000', 'ETH 500 usd', 'bought 0.5 eth at 2000', 'USDT 100', 'eth all'
+    -> {symbol, qty|None (all), price|None, usd|None}. ``usd`` is set when the first number is a dollar amount (qty is then worked out from the price).
+    Raises ValueError with a helpful message."""
+    rest, usd, cur = split_money(text)
+    clean = normalize(rest)
     words = re.findall(r"[A-Za-z]+|\d[\d,]*\.?\d*|\.\d+|[^\s\w]|\w+", clean)
     numbers = [float(w.replace(",", "")) for w in words if re.fullmatch(r"\d[\d,]*\.?\d*|\.\d+", w)]
     wants_all = any(w.lower() in ALL_WORDS for w in words)
     base = "USDT" if any(w.upper() == "USDT" for w in words) and not any(w.upper().endswith("USDT") and len(w) > 4 for w in words) else None
     if base is None:
         base = understand(clean, known).symbol
+    if usd is not None and base in (None, "USDT"):
+        if cur == "usdt": return {"symbol": "USDT/USDT", "qty": usd, "price": 1.0, "usd": None}     # '100 usdt' on its own = cash
+        base = None if base == "USDT" else base
     if not base:
-        raise ValueError("কোন coin তা বুঝতে পারিনি। coin-এর নাম দিন, যেমন: ETH 0.5 2000")
+        raise ValueError("কোন coin তা বুঝতে পারিনি। coin-এর নাম দিন, যেমন: ETH 0.5 2000 অথবা ETH 500 usd")
     if base == "USDT":
         qty = None if wants_all else (numbers[0] if numbers else None)
         if qty is None and not wants_all: raise ValueError("কত USDT? উদাহরণ: USDT 100")
-        return {"symbol": "USDT/USDT", "qty": qty, "price": 1.0}
+        return {"symbol": "USDT/USDT", "qty": qty, "price": 1.0, "usd": None}
+    if usd is not None:                                                  # 'ETH 500 usd' [price]: spend that many dollars
+        if usd <= 0: raise ValueError("ডলারের পরিমাণ শূন্যের চেয়ে বেশি হতে হবে।")
+        if wants_all: raise ValueError("'all' আর ডলারের পরিমাণ একসঙ্গে লেখা যাবে না। হয় ETH all, নয়তো ETH 500 usd লিখুন।")
+        price = numbers[0] if numbers else None
+        if price is not None and price <= 0: raise ValueError("দাম শূন্যের চেয়ে বেশি হতে হবে।")
+        return {"symbol": f"{base}/USDT", "qty": None, "price": price, "usd": usd}
     if wants_all: qty = None; price = numbers[0] if numbers else None
     else:
-        if not numbers: raise ValueError("পরিমাণ লিখুন। উদাহরণ: ETH 0.5 2000")
+        if not numbers: raise ValueError("পরিমাণ লিখুন। উদাহরণ: ETH 0.5 2000 অথবা ETH 500 usd")
         qty = numbers[0]; price = numbers[1] if len(numbers) > 1 else None
     if qty is not None and qty <= 0: raise ValueError("পরিমাণ শূন্যের চেয়ে বেশি হতে হবে।")
     if price is not None and price <= 0: raise ValueError("দাম শূন্যের চেয়ে বেশি হতে হবে।")
-    return {"symbol": f"{base}/USDT", "qty": qty, "price": price}
+    return {"symbol": f"{base}/USDT", "qty": qty, "price": price, "usd": None}
 
 
-async def apply_portfolio_trade(uid: int, side: str, symbol: str, qty: float | None, price: float | None) -> str:
-    """Record a buy/sell atomically. qty None means 'everything I hold' (sell only)."""
+async def apply_portfolio_trade(uid: int, side: str, symbol: str, qty: float | None, price: float | None, usd: float | None = None) -> str:
+    """Record a buy/sell atomically. qty None means 'everything I hold' (sell only). ``usd`` = spend/receive that many dollars: qty = usd / price."""
     assert BOT is not None and BOT.db is not None
     base = symbol.split("/")[0]
     if price is None:
         live = await BOT.fetch_live_price(symbol)
         if not live.get("price"): raise UserInputError("এখনকার দাম পাওয়া যায়নি; দাম নিজে লিখুন।")
         price = float(live["price"])
+    dollar_line = ""
+    if usd is not None:                                              # 'ETH 500 usd' -> how many ETH is that at this price
+        qty = round(usd / price, 8)
+        if qty <= 0: raise UserInputError("এই ডলারে খুব সামান্য পরিমাণ হয়; আরও বেশি ডলার লিখুন।")
+        dollar_line = f"💵 ${usd:,.2f} ÷ {price:.8g} = {plain_amount(qty)} {base}\n"
     async with BOT.db.acquire() as con:
         async with con.transaction():
             row = await con.fetchrow("SELECT qty,avg_price,realized FROM portfolio_positions WHERE telegram_id=$1 AND symbol=$2 FOR UPDATE", uid, symbol)
@@ -5818,7 +5870,7 @@ async def apply_portfolio_trade(uid: int, side: str, symbol: str, qty: float | N
             await con.execute("""INSERT INTO portfolio_positions(telegram_id,symbol,qty,avg_price,realized,updated_at) VALUES($1,$2,$3,$4,$5,NOW())
                 ON CONFLICT(telegram_id,symbol) DO UPDATE SET qty=EXCLUDED.qty,avg_price=EXCLUDED.avg_price,realized=EXCLUDED.realized,updated_at=NOW()""", uid, symbol, nq, na, nr)
     shown = f"{base} @ {price:.8g}" if base != "USDT" else "USDT"
-    return f"✅ {'Buy' if side == 'buy' else 'Sell'} {plain_amount(float(qty or 0))} {shown}\n" + (note + "\n" if note else "") + f"এখন হোল্ডিং: {plain_amount(nq)} {base}"
+    return f"✅ {'Buy' if side == 'buy' else 'Sell'} {plain_amount(float(qty or 0))} {shown}\n" + dollar_line + (note + "\n" if note else "") + f"এখন হোল্ডিং: {plain_amount(nq)} {base}"
 
 
 async def finish_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str, text: str, junk: list[Any] | None = None) -> None:
@@ -5830,7 +5882,7 @@ async def finish_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
     try:
         parsed = parse_trade_text(text, BOT.known_bases())
         await BOT.ensure_user(update); uid = update.effective_user.id
-        result = await apply_portfolio_trade(uid, side, parsed["symbol"], parsed["qty"], parsed["price"])
+        result = await apply_portfolio_trade(uid, side, parsed["symbol"], parsed["qty"], parsed["price"], parsed.get("usd"))
     except (ValueError, UserInputError) as exc:
         warn = await msg.reply_text(f"⚠️ {exc}\nআবার লিখুন (বাতিল করতে: cancel)।")
         context.user_data["pf_pending"] = {"side": side, "at": time.time(), "msgs": junk + [msg_ref(update, warn)]}      # retry without pressing the button again
@@ -5846,8 +5898,7 @@ async def finish_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
 
 async def portfolio_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str) -> None:
     if not context.args:
-        example = "ETH 0.5 2000" if side == "buy" else "ETH 0.2 2100"
-        sent = await update.effective_message.reply_text(f"{'🟢 কী কিনেছেন' if side == 'buy' else '🔴 কী বিক্রি করেছেন'}? লিখুন: coin, পরিমাণ, দাম\nউদাহরণ: {example}\n(বাতিল করতে: cancel)")
+        sent = await update.effective_message.reply_text(trade_prompt(side))
         context.user_data["pf_pending"] = {"side": side, "at": time.time(), "msgs": [msg_ref(update, update.effective_message), msg_ref(update, sent)]}; return
     await finish_trade(update, context, side, " ".join(context.args))
 

@@ -9,6 +9,7 @@ TradingView-style chart plus a written report. This is analysis software, **not 
   volume profile). Gemini only explains the numbers; it does not compute them.
 - Breakout history, backtest (fees, slippage, in/out-of-sample), signal scorecard, multi-timeframe confluence.
 - Price/level alerts, watchlist, scanner, portfolio PnL, futures trade manager, daily market report.
+- Portfolio trades via /buy, /sell or the Buy/Sell buttons: by coin amount (`ETH 0.5 2000`) or by dollars (`ETH 500 usd` = $500 worth at the live price, `ETH 500 usd 2000` = $500 at price 2000).
 - Free / Pro / Admin plans, free trial, referral bonus, manual bKash/Nagad approval flow.
 
 ## Layout
