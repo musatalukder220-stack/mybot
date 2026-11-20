@@ -17,5 +17,5 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - run: pip install -r requirements-dev.txt
       - name: Undefined names (catches missing imports after refactors)
-        run: python -m pyflakes bot.py pro_quant.py pro_features.py | grep "undefined name" && exit 1 || true
+        run: python -m pyflakes bot.py pro_quant.py pro_features.py perf_stats.py | grep "undefined name" && exit 1 || true
       - run: python -m pytest -q

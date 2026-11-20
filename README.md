@@ -18,9 +18,13 @@ TradingView-style chart plus a written report. This is analysis software, **not 
 | `bot.py` | Telegram handlers, NLU, exchange pool, database, charts, jobs, `main()` |
 | `pro_quant.py` | Indicators, market structure, liquidity, imbalances, volume profile, position size |
 | `pro_features.py` | TTL cache, retest state, explainable score, data quality, event fingerprint |
+| `perf_stats.py` | Latency recorder (handlers, Gemini) and event-loop lag probe behind the admin `/health` command |
 | `test_*.py` | pytest suite |
 
 `bot.py` imports the two `pro_*` modules, so there is a single copy of that logic.
+
+### Performance notes
+Admin `/health` shows live DB / exchange / Telegram round-trip times, event-loop lag, p50/p95 per handler and Gemini calls, and a list of recent responses slower than 3 s. Plan and settings lookups are cached for 15-30 s (and cleared on every write), tickers for 3 s, RSS headlines for 5 min, per-coin futures context for 2 min, and BTC/ETH/multi-timeframe indicator snapshots per closed candle.
 
 ## Run locally
 ```bash

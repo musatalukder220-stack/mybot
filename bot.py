@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import difflib
 import functools
 import hashlib
@@ -113,6 +114,7 @@ except Exception as _import_exc:  # noqa: BLE001 - report, then fail loudly so R
     raise
 
 # Quant indicators and pro helpers live in their own modules (single source of truth, unit-tested).
+from perf_stats import LatencyStats, fmt as fmt_latency, loop_lag_probe
 from pro_features import TTLCache, data_quality, event_fingerprint, explainable_score, retest_state  # noqa: E402
 from pro_quant import (_f, add_indicators, imbalances, liquidity, patterns, position_size, snapshot, structure,  # noqa: E402
                        swings, volume_profile)
@@ -2388,6 +2390,16 @@ def simple_backtest(df: pd.DataFrame, timeframe: str = "4h", fee_pct: float = 0.
             "assumptions":f"entry at signal close; 1 ATR stop; 2 ATR target; max {max_hold} candles; fee {fee_pct}% + slippage {slippage_pct}% per side; in-sample = first {int(split*100)}% of candles"}
 
 
+RSS_FEEDS = {
+    "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "Cointelegraph": "https://cointelegraph.com/rss",
+    "Decrypt": "https://decrypt.co/feed",
+    "CryptoSlate": "https://cryptoslate.com/feed/",
+    "The Block": "https://www.theblock.co/rss.xml",
+    "CryptoPotato": "https://cryptopotato.com/feed/",
+}
+
+
 class AnalystBot:
     def __init__(self) -> None:
         # Current Google Gen AI SDK; unlike the retired google-generativeai SDK,
@@ -2410,7 +2422,9 @@ class AnalystBot:
         if not DATABASE_URL:
             log.warning("DATABASE_URL absent: persistent alerts/watchlists are disabled")
             return
-        self.db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, command_timeout=30)
+        # Two warm connections (a cold connect to a hosted Postgres costs 100-500 ms) and a long idle
+        # lifetime; db_keepalive_job pings them so they are never dropped between messages.
+        self.db = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=8, command_timeout=30, max_inactive_connection_lifetime=1800)
         async with self.db.acquire() as con:
             await con.execute("""
                 CREATE TABLE IF NOT EXISTS users(
@@ -2499,16 +2513,31 @@ class AnalystBot:
 
     async def ensure_user(self, update: Update) -> None:
         if not self.db or not update.effective_user: return
-        await self.db.execute("INSERT INTO users(telegram_id,username) VALUES($1,$2) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username",
-                              update.effective_user.id, update.effective_user.username)
+        uid, name = update.effective_user.id, update.effective_user.username
+        # The upsert used to run on every message (one DB round trip each). Once per
+        # 10 minutes per user is enough unless the username actually changed.
+        key, marker = f"seen:{uid}", f"u:{name or ''}"
+        if self.cache.get(key) == marker: return
+        await self.db.execute("INSERT INTO users(telegram_id,username) VALUES($1,$2) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username", uid, name)
+        self.cache.set(key, marker, 600)
 
     async def effective_plan(self, user_id: int | None) -> str:
         if user_id in ADMIN_IDS: return "admin"
         if not self.db or not user_id: return "free"
+        key = f"plan:{user_id}"
+        hit = self.cache.get(key)
+        if hit is not None: return hit
         row=await self.db.fetchrow("SELECT plan,plan_until,blocked FROM users WHERE telegram_id=$1",user_id)
-        if row and row["blocked"]: return "blocked"
-        if row and row["plan"]=="pro" and row["plan_until"] and row["plan_until"]>datetime.now(timezone.utc): return "pro"
-        return "free"
+        if row and row["blocked"]: plan="blocked"
+        elif row and row["plan"]=="pro" and row["plan_until"] and row["plan_until"]>datetime.now(timezone.utc): plan="pro"
+        else: plan="free"
+        self.cache.set(key, plan, 15)   # every message asked the DB; 15s keeps approvals/blocks near-instant
+        return plan
+
+    def forget_user(self, user_id: int | None) -> None:
+        """Drop cached plan/settings after a write so the change shows up instantly."""
+        if user_id is None: return
+        for prefix in ("plan", "settings"): self.cache._data.pop(f"{prefix}:{user_id}", None)
 
     async def has_access(self, user_id: int | None) -> bool:
         return await self.effective_plan(user_id) in {"pro", "admin"}
@@ -2540,9 +2569,14 @@ class AnalystBot:
 
     async def user_settings(self, user_id: int | None) -> dict[str,str]:
         defaults={"detail_mode":"standard","risk_mode":"balanced","timezone":"Asia/Dhaka","language":"bn","chart_theme":""}
-        if not self.db or not user_id: return defaults
+        if not self.db or not user_id: return dict(defaults)
+        key = f"settings:{user_id}"
+        hit = self.cache.get(key)
+        if hit is not None: return dict(hit)
         row=await self.db.fetchrow("SELECT detail_mode,risk_mode,timezone,language,chart_theme FROM users WHERE telegram_id=$1",user_id)
-        return dict(row) if row else defaults
+        value = dict(row) if row else dict(defaults)
+        self.cache.set(key, value, 30)
+        return dict(value)
 
     async def close(self) -> None:
         if self.db: await self.db.close()
@@ -2576,9 +2610,11 @@ class AnalystBot:
         retry_delays=(2,5,10,20)
         for attempt in range(5):
             try:
+                started = time.perf_counter()
                 response = await self.gemini.aio.models.generate_content(
                     model=MODEL_NAME, contents=contents, config=config
                 )
+                STATS.record("gemini", time.perf_counter() - started)
                 if not response.text:
                     raise RuntimeError("Gemini returned an empty response")
                 return self._json(response.text)
@@ -2733,7 +2769,12 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         return frame
 
     async def fetch_live_price(self, symbol: str) -> dict[str,Any]:
-        """Fetch an uncached ticker for display; never confirms a signal."""
+        """Ticker for display; never confirms a signal. Shared for 3s so concurrent users/jobs asking
+        for the same coin trigger one exchange call instead of one each."""
+        data = await self.cache.get_or_create(f"ticker:{symbol}", 3.0, lambda: self._fetch_live_price(symbol))
+        return dict(data)
+
+    async def _fetch_live_price(self, symbol: str) -> dict[str,Any]:
         try:
             ticker, source = await self.pool.call("fetch_ticker", symbol)
             price = float(ticker.get("last") or ticker.get("close") or 0)
@@ -2744,7 +2785,32 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
             log.warning("Live ticker unavailable for %s: %s", symbol, exc)
             return {}
 
+    async def rss_entries(self, session: aiohttp.ClientSession) -> list[tuple[str, Any]]:
+        """Parsed (source, entry) pairs from every RSS desk, cached 5 minutes and shared by all coins/users."""
+        async def load() -> list[tuple[str, Any]]:
+            payloads = await asyncio.gather(*(session.get(url) for url in RSS_FEEDS.values()), return_exceptions=True)
+            found: list[tuple[str, Any]] = []
+            for (source, _url), response in zip(RSS_FEEDS.items(), payloads):
+                if isinstance(response, BaseException): continue
+                try:
+                    raw = await response.read()
+                    found.extend((source, item) for item in feedparser.parse(raw).entries[:20])
+                except Exception as exc: log.warning("RSS %s unreadable: %s", source, exc)
+                finally: response.release()
+            return found
+        entries = await self.cache.get_or_create("rss:entries", 300, load)
+        if not entries: self.cache._data.pop("rss:entries", None)      # all feeds failed: retry on the next request, do not cache the failure
+        return entries
+
     async def external_context(self, request: Request, all_market: bool = False, extended: bool = False, price_change_pct: float = 0.0) -> dict[str, Any]:
+        """Per-coin context, shared for 2 minutes (concurrent users asking about one coin make one set of calls)."""
+        key = f"extctx:{request.symbol}:{request.timeframe}:{int(all_market)}:{int(extended)}"
+        data = await self.cache.get_or_create(key, 120, lambda: self._external_context(request, all_market, extended, price_change_pct))
+        if data.get("funding_rate") is None and data.get("news_status") == "unavailable":
+            self.cache._data.pop(key, None)                           # total failure: do not keep it
+        return copy.deepcopy(data)
+
+    async def _external_context(self, request: Request, all_market: bool = False, extended: bool = False, price_change_pct: float = 0.0) -> dict[str, Any]:
         """Best-effort public futures context and reputable RSS headlines.
 
         Failure never blocks technical analysis. Headlines are clearly treated
@@ -2777,24 +2843,10 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
                     good = [None if isinstance(x, BaseException) else x for x in extra]
                     context["futures_flow"] = futures_flow(good[0], good[1], good[2], price_change_pct)
                     context["sentiment"] = {"fear_greed": parse_fear_greed(good[3]), "global": parse_global_market(good[4])}
-                # Multiple independent, free RSS desks improve recency and coin coverage.
-                # A failed/paywalled source is ignored and never blocks the analysis.
-                feeds={
-                    "CoinDesk":"https://www.coindesk.com/arc/outboundfeeds/rss/",
-                    "Cointelegraph":"https://cointelegraph.com/rss",
-                    "Decrypt":"https://decrypt.co/feed",
-                    "CryptoSlate":"https://cryptoslate.com/feed/",
-                    "The Block":"https://www.theblock.co/rss.xml",
-                    "CryptoPotato":"https://cryptopotato.com/feed/",
-                }
-                payloads = await asyncio.gather(*(session.get(url) for url in feeds.values()), return_exceptions=True)
-                entries=[]
-                for (source,url),response in zip(feeds.items(),payloads):
-                    if isinstance(response, Exception): continue
-                    try:
-                        raw = await response.read()
-                        entries.extend((source,item) for item in feedparser.parse(raw).entries[:20])
-                    finally: response.release()
+                # RSS desks are identical for every coin: fetch them once per 5 minutes and share the
+                # parsed entries (this was 6 HTTP calls on every single analysis).
+                entries = await self.rss_entries(session)
+                feeds = RSS_FEEDS
                 base = request.symbol.split("/")[0].lower()
                 aliases={"btc":{"btc","bitcoin"},"eth":{"eth","ethereum"},"bnb":{"bnb","binance coin","binance"},"sui":{"sui"},"sei":{"sei"},"sol":{"sol","solana"}}
                 coin_terms=aliases.get(base,{base}); global_terms={"bitcoin","ethereum","crypto market","regulation","fed","etf"}
@@ -2881,12 +2933,18 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         scanned = await asyncio.gather(*(scan(x) for x in symbols), return_exceptions=True)
         return sorted((x for x in scanned if not isinstance(x, BaseException)), reverse=True)[:keep]
 
+    async def quant_cached(self, symbol: str, tf: str, frame: pd.DataFrame) -> dict[str, Any]:
+        """quant_snapshot in a worker thread, memoised per closed candle (BTC/ETH and 1h/4h/1d snapshots are re-used by every analysis).
+        Read-only for callers: the returned dict is shared."""
+        key = f"qs:{symbol}:{tf}:{len(frame)}:{frame.index[-1].value}"
+        return await self.cache.get_or_create(key, 300, lambda: asyncio.to_thread(quant_snapshot, frame))
+
     async def higher_timeframe(self, request: Request) -> dict[str, Any]:
         higher = "1d" if request.timeframe not in ("1d","3d","1w","1mo","3mo") else "1w" if request.timeframe in ("1d","3d") else "1mo"
         if request.timeframe in ("1mo","3mo"): return {"timeframe":request.timeframe,"status":"unavailable"}
         try:
             other = await self.fetch_candles(Request(request.symbol, higher))
-            q = quant_snapshot(other)
+            q = await self.quant_cached(request.symbol, higher, other)
             return {"timeframe":higher,"structure":q["structure"],"rsi":q["rsi"],"price_above_ema50":q["last"]>q["ema50"]}
         except Exception as exc:
             log.warning("Higher timeframe unavailable: %s", exc)
@@ -2899,7 +2957,7 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         async def one(tf: str) -> dict[str, Any]:
             try:
                 frame = await self.fetch_candles(Request(request.symbol, tf), count=250)
-                q = await asyncio.to_thread(quant_snapshot, frame)
+                q = await self.quant_cached(request.symbol, tf, frame)
                 return {"timeframe": tf, **timeframe_bias(q)}
             except Exception as exc:  # noqa: BLE001
                 log.warning("MTF %s %s unavailable: %s", request.symbol, tf, exc)
@@ -2909,7 +2967,7 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
     async def market_filter(self, timeframe: str) -> dict[str,Any]:
         tf=timeframe if timeframe in {"15m","1h","4h","1d"} else "4h"
         async def one(symbol:str):
-            f=await self.fetch_candles(Request(symbol,tf)); q=quant_snapshot(f)
+            f=await self.fetch_candles(Request(symbol,tf)); q=await self.quant_cached(symbol,tf,f)
             return {"symbol":symbol,"structure":q["structure"],"above_ema50":q["last"]>q["ema50"],"rsi":q["rsi"]}
         try:
             btc,eth=await asyncio.gather(one("BTC/USDT"),one("ETH/USDT"))
@@ -2919,16 +2977,18 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
             log.warning("Market filter unavailable: %s",exc); return {}
 
     async def analyze(self, request: Request, frame: pd.DataFrame, detail_mode: str = "standard", live: dict[str,Any] | None = None, lang: str = "bn") -> dict[str, Any]:
-        quant = await asyncio.to_thread(quant_snapshot, frame)   # CPU-heavy on long ranges: keep the event loop free
+        # CPU-heavy on long ranges: worker thread, and started now so it overlaps the network fetches below.
+        quant_task = asyncio.create_task(asyncio.to_thread(quant_snapshot, frame))
         live=live or {}
         lang_name = "English" if lang == "en" else "Bengali"
         window = frame.iloc[-(request.view_candles or len(frame)):]
         change24 = float(frame.Close.iloc[-1] / frame.Close.iloc[-min(25, len(frame))] - 1) * 100
+        context, higher, market, mtf = await asyncio.gather(self.external_context(request, extended=True, price_change_pct=change24),
+                                                            self.higher_timeframe(request), self.market_filter(request.timeframe), self.mtf_context(request))
+        quant = await quant_task
         quant["live_price"]=live.get("price")
         quant["last_closed_price"]=float(frame.Close.iloc[-1])
         quant["last_closed_time"]=frame.index[-1].isoformat()
-        context, higher, market, mtf = await asyncio.gather(self.external_context(request, extended=True, price_change_pct=change24),
-                                                            self.higher_timeframe(request), self.market_filter(request.timeframe), self.mtf_context(request))
         quant["mtf"] = mtf
         view_range = None
         if request.range_days:
@@ -2939,10 +2999,12 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         quant["retest"]=retest_state(frame,quant["breakout"])
         quant["explainable_score"]=explainable_score(quant,higher,market,context)
         quant["data_quality"]=data_quality(len(frame),higher,context,market)
+        # Only the last 60 candles go into the prompt; building dicts for thousands of rows was wasted work.
+        first = max(0, len(frame) - 60)
         candles = [
-            {"i": i, "t": idx.isoformat(), "o": round(r.Open, 10), "h": round(r.High, 10),
+            {"i": first + i, "t": idx.isoformat(), "o": round(r.Open, 10), "h": round(r.High, 10),
              "l": round(r.Low, 10), "c": round(r.Close, 10), "v": round(r.Volume, 4)}
-            for i, (idx, r) in enumerate(frame.iterrows())
+            for i, (idx, r) in enumerate(frame.iloc[first:].iterrows())
         ]
         supports = [z["price"] for z in quant["supports"]]
         resistances = [z["price"] for z in quant["resistances"]]
@@ -3349,25 +3411,29 @@ async def run_request(update: Update, request: Request) -> None:
     try:
         if request.note: await message.reply_text("ℹ️ " + request.note)
         async with BOT.semaphore:
-            await message.chat.send_action(ChatAction.TYPING)
+            fire(message.chat.send_action(ChatAction.TYPING))       # cosmetic: never make the user wait for it
             frame,live = await asyncio.gather(BOT.fetch_candles(request),BOT.fetch_live_price(request.symbol))
             detail_mode=requested_detail_mode(request.transcript,settings["detail_mode"])
             result = await BOT.analyze(request, frame, detail_mode=detail_mode, live=live, lang=lang)
             apply_confirmation_mode(result,settings["risk_mode"])
             if detail_mode=="quick" and lang=="bn":
                 result["analysis_bn"]=quick_report(request,result)
-            if BOT.db and update.effective_user:
+            async def save_history() -> None:
+                if not (BOT.db and update.effective_user): return
                 await BOT.ensure_user(update)
                 previous=await BOT.db.fetchval("SELECT payload FROM analyses WHERE telegram_id=$1 AND symbol=$2 AND timeframe=$3 ORDER BY created_at DESC LIMIT 1",update.effective_user.id,request.symbol,request.timeframe)
                 if lang=="bn": result["analysis_bn"] += comparison_text(previous,result["quant"])
                 await BOT.db.execute("INSERT INTO analyses(telegram_id,symbol,timeframe,state,price,payload) VALUES($1,$2,$3,$4,$5,$6::jsonb)",
                     update.effective_user.id,request.symbol,request.timeframe,result["quant"]["breakout"]["state"],float(frame.Close.iloc[-1]),json.dumps(result["quant"]))
+            history_task = asyncio.create_task(save_history())       # DB round trips overlap the chart render below
             # Cache a ready-to-paste Pine script for the chart button.
             pine=make_pine_script(request.symbol,request.timeframe,frame,result)
             pine_key=f"pine:{update.effective_user.id if update.effective_user else 0}:{request.symbol}:{request.timeframe}"
             BOT.cache.set(pine_key,pine,ttl=86400)
             # Matplotlib is CPU-bound: render in a worker thread (serialised by CHART_LOCK) so the event loop stays free.
-            image = await BOT.chart_async(frame, request, result, theme=settings.get("chart_theme"))
+            try: image = await BOT.chart_async(frame, request, result, theme=settings.get("chart_theme"))
+            except BaseException: history_task.cancel(); raise
+            await history_task
             if uid is not None: BOT.cache.set(f"chartctx:{uid}:{request.symbol}:{request.timeframe}", (frame, request, result), ttl=3600)   # for the Smart zones button
         bo = result["quant"]["breakout"]
         state_text=colored_state(bo['state'],bengali=(lang=="bn"))
@@ -3757,6 +3823,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     r=await BOT.db.fetchrow("SELECT * FROM subscription_requests WHERE id=$1 AND status='pending'",int(parts[1]))
                     if not r: await admin_show(q,"Request আর pending নেই।",after); return
                     await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',blocked=FALSE WHERE telegram_id=$1",r['telegram_id'],r['days'])
+                    BOT.forget_user(r['telegram_id'])
                     await BOT.db.execute("UPDATE subscription_requests SET status='approved',reviewed_at=NOW() WHERE id=$1",r['id'])
                     await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'approve',$2,$3::jsonb)",update.effective_user.id,r['telegram_id'],json.dumps({"days":r['days'],"request_id":r['id']}))
                     await BOT.db.execute("UPDATE users SET expiry_3d_sent=FALSE,expiry_1d_sent=FALSE WHERE telegram_id=$1",r['telegram_id'])
@@ -3776,6 +3843,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 if uid in ADMIN_IDS: note="ℹ️ Admin-এর access সবসময় Unlimited — মেয়াদ বাড়ানোর দরকার নেই।"
                 else:
                     await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',expiry_3d_sent=FALSE,expiry_1d_sent=FALSE WHERE telegram_id=$1",uid,days)
+                    BOT.forget_user(uid)
                     await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'extend',$2,$3::jsonb)",update.effective_user.id,uid,json.dumps({"days":days}))
                     await set_user_menu(context.bot,uid,"pro")
                     try: await context.bot.send_message(uid,f"✅ আপনার Pro access {days} দিন বাড়ানো হয়েছে।")
@@ -3787,6 +3855,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 if uid in ADMIN_IDS: note="ℹ️ Admin-কে block করা যায় না।"
                 else:
                     await BOT.db.execute("UPDATE users SET blocked=$1 WHERE telegram_id=$2",blocked,uid)
+                    BOT.forget_user(uid)
                     await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,$2,$3,'{}'::jsonb)",update.effective_user.id,"block" if blocked else "unblock",uid)
                     await set_user_menu(context.bot,uid,"free" if blocked else await BOT.effective_plan(uid))
                     try: await context.bot.send_message(uid,"আপনার bot access block করা হয়েছে।" if blocked else "আপনার bot access unblock করা হয়েছে।")
@@ -3936,6 +4005,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await q.message.reply_text("Professional report Pro feature। বিস্তারিত জানতে /subscribe পাঠান।"); return
             await BOT.ensure_user(update)
             await BOT.db.execute(f"UPDATE users SET {field}=$1 WHERE telegram_id=$2",value,update.effective_user.id)
+            BOT.forget_user(update.effective_user.id)
             field_bn={"detail_mode":"Report mode","risk_mode":"Confirmation mode","language":"Language","chart_theme":"Chart theme"}.get(field,field)
             shown=CHART_THEME_LABELS[value] if field=="chart_theme" else value.title()
             await q.message.reply_text(f"✅ {field_bn} পরিবর্তন হয়েছে: {shown}"+(" — পরের চার্ট থেকে কার্যকর হবে।" if field=="chart_theme" else "")); return
@@ -4412,20 +4482,35 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try: ZoneInfo(value)
     except ZoneInfoNotFoundError: await update.effective_message.reply_text("সঠিক IANA timezone দিন, যেমন Asia/Dhaka বা UTC"); return
     if not BOT.db: await update.effective_message.reply_text("Timezone save করতে DATABASE_URL প্রয়োজন।"); return
-    await BOT.ensure_user(update); await BOT.db.execute("UPDATE users SET timezone=$1 WHERE telegram_id=$2",value,update.effective_user.id)
+    await BOT.ensure_user(update); await BOT.db.execute("UPDATE users SET timezone=$1 WHERE telegram_id=$2",value,update.effective_user.id); BOT.forget_user(update.effective_user.id)
     await update.effective_message.reply_text(f"✅ Timezone: {value}")
 
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context; assert BOT is not None
+    assert BOT is not None
     if update.effective_user.id not in ADMIN_IDS: await update.effective_message.reply_text("এই command শুধু Admin-এর জন্য।"); return
-    db="disabled"; exchange="unknown"
-    if BOT.db:
-        try: await BOT.db.fetchval("SELECT 1"); db="ok"
-        except Exception: db="error"
-    try: await BOT.exchange.fetch_time(); exchange="ok"
-    except Exception: exchange="error"
+    db="disabled"; exchange="unknown"; db_ms=ex_ms=tg_ms=None
+    async def timed(coro: Any) -> float | None:
+        start=time.perf_counter()
+        try: await coro
+        except Exception: return None
+        return (time.perf_counter()-start)*1000
+    async def db_two() -> float | None:                     # a warm query, then the typical per-message cost
+        if not BOT.db: return None
+        return await timed(BOT.db.fetchval("SELECT 1"))
+    db_ms,ex_ms,tg_ms=await asyncio.gather(db_two(),timed(BOT.exchange.fetch_time()),timed(context.bot.get_me()))
+    if BOT.db: db="ok" if db_ms is not None else "error"
+    exchange="ok" if ex_ms is not None else "error"
+    ms=lambda v:"error" if v is None else f"{v:.0f} ms"
     scan=BOT.last_alert_scan.isoformat(timespec="seconds") if BOT.last_alert_scan else "not yet"
-    await update.effective_message.reply_text(f"Health\n\nBot: ok\nDatabase: {db}\nExchange: {exchange}\nGemini model: {MODEL_NAME}\nLast alert scan: {scan}\nCache entries: {len(BOT.cache._data)}")
+    lines=[f"Health\n\nBot: ok\nDatabase: {db} ({ms(db_ms)})\nExchange: {exchange} ({ms(ex_ms)})\nTelegram API: {ms(tg_ms)}",
+           f"Event-loop lag: now {STATS.loop_lag_last*1000:.0f} ms · peak {STATS.loop_lag_max*1000:.0f} ms (বেশি হলে CPU কাজ সবাইকে আটকে দিচ্ছে)",
+           f"Gemini model: {MODEL_NAME}\nLast alert scan: {scan}\nCache entries: {len(BOT.cache._data)}"]
+    for name in STATS.names():
+        lines.append(f"{name}: {fmt_latency(STATS.summary(name))}")
+    if STATS.slow:
+        lines.append("\nSlow (≥3s) recent:")
+        lines.extend(f"• {datetime.fromtimestamp(t,timezone.utc).strftime('%H:%M:%S')} {n} {s:.1f}s" for t,n,s in list(STATS.slow)[-8:])
+    await update.effective_message.reply_text("\n".join(lines))
 
 async def user_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
@@ -4639,6 +4724,7 @@ async def subscription_expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         seconds=(r['plan_until']-now).total_seconds()
         if seconds<=0:
             await BOT.db.execute("UPDATE users SET plan='free' WHERE telegram_id=$1",r['telegram_id']); await set_user_menu(context.bot,r['telegram_id'],"free")
+            BOT.forget_user(r['telegram_id'])
             try: await context.bot.send_message(r['telegram_id'],"আপনার Pro access-এর মেয়াদ শেষ হয়েছে। পুনরায় নিতে /subscribe পাঠান।")
             except Exception: pass
         elif seconds<=86400 and not r['expiry_1d_sent']:
@@ -4697,6 +4783,18 @@ async def notify_admins_error(bot: Any, title: str, exc: BaseException) -> None:
             except Exception: log.warning("Could not send error report to admin %s", admin_id)
     except Exception:  # noqa: BLE001 - reporting must never raise
         log.exception("Error reporting failed")
+
+
+STATS = LatencyStats()
+_BACKGROUND: set[Any] = set()
+
+def fire(coro: Any) -> None:
+    """Run a cosmetic/side-effect coroutine without awaiting it; errors are swallowed, a reference is kept so it is not garbage-collected."""
+    async def runner() -> None:
+        try: await coro
+        except Exception: pass
+    task = asyncio.get_running_loop().create_task(runner())
+    _BACKGROUND.add(task); task.add_done_callback(_BACKGROUND.discard)
 
 
 def guarded_job(job: Any) -> Any:
@@ -5647,16 +5745,21 @@ async def portfolio_render(uid: int, page: int) -> tuple[bytes, str, InlineKeybo
     rows = [dict(r) for r in await BOT.db.fetch("SELECT symbol,qty,avg_price,realized FROM portfolio_positions WHERE telegram_id=$1", uid)]
     held = [r for r in rows if float(r["qty"]) > 0 and not r["symbol"].startswith("USDT/")]
     if not any(float(r["qty"]) > 0 for r in rows): return None
+    async def logo(base: str) -> bytes | None:
+        try: return await asyncio.wait_for(fetch_coin_logo(f"{base}/USDT"), 4)
+        except Exception: return None          # the coloured letter badge is used instead
+    # Prices and logos are independent: fetch them together instead of one after the other.
+    bases = [r["symbol"].split("/")[0] for r in held][:PF_PAGE_SIZE * 3]
+    logo_task = asyncio.gather(*(logo(b) for b in bases))
     lives = await asyncio.gather(*(BOT.fetch_live_price(r["symbol"]) for r in held), return_exceptions=True)
+    logos = dict(zip(bases, await logo_task))
     view = build_portfolio_view(rows, {r["symbol"]: x for r, x in zip(held, lives) if isinstance(x, dict)})
     pages = portfolio_pages(view); page = min(max(page, 0), pages - 1)
     shown = view["items"][page * PF_PAGE_SIZE:(page + 1) * PF_PAGE_SIZE]
 
-    async def logo(base: str) -> bytes | None:
-        try: return await asyncio.wait_for(fetch_coin_logo(f"{base}/USDT"), 4)
-        except Exception: return None          # the coloured letter badge is used instead
-    pictures = await asyncio.gather(*(logo(i["base"]) for i in shown))
-    image = await asyncio.to_thread(render_portfolio_image, view, page, dict(zip((i["base"] for i in shown), pictures)))
+    missing = [i["base"] for i in shown if i["base"] not in logos]
+    if missing: logos.update(zip(missing, await asyncio.gather(*(logo(b) for b in missing))))
+    image = await asyncio.to_thread(render_portfolio_image, view, page, {i["base"]: logos.get(i["base"]) for i in shown})
     return image, portfolio_caption(view, page, pages), portfolio_keyboard(page, pages), page
 
 
@@ -5888,11 +5991,16 @@ async def finish_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
         context.user_data["pf_pending"] = {"side": side, "at": time.time(), "msgs": junk + [msg_ref(update, warn)]}      # retry without pressing the button again
         return
     view = PF_VIEWS.get(uid)
-    if view:                                                           # picture first, so it changes the moment the coin is added
+
+    async def refresh_picture() -> None:
+        if not view: return
         view["expires"] = time.time() + PF_LIVE_MINUTES * 60
         try: await portfolio_push(context.bot, uid, view)
         except (BadRequest, NetworkError, TimedOut) as exc: forget_if_gone(uid, exc)
-    done = await msg.reply_text(result)
+        except Exception: log.exception("Portfolio refresh after trade failed")
+    # The confirmation used to wait for the whole picture rebuild (prices, logos, render, upload).
+    # Send both at once so "✅ Buy" appears immediately while the picture updates in parallel.
+    done, _ = await asyncio.gather(msg.reply_text(result), refresh_picture())
     schedule_delete(context.bot, junk + [msg_ref(update, done)])
 
 
@@ -6077,6 +6185,7 @@ async def reward_referrer(bot: Any, user_id: int) -> None:
     ref = await BOT.db.fetchval("UPDATE users SET referral_rewarded=TRUE WHERE telegram_id=$1 AND referred_by IS NOT NULL AND NOT referral_rewarded RETURNING referred_by", user_id)
     if not ref: return
     await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',referral_days_earned=referral_days_earned+$2 WHERE telegram_id=$1", ref, REFERRAL_BONUS_DAYS)
+    BOT.forget_user(ref)
     await set_user_menu(bot, ref, "pro")
     try: await bot.send_message(ref, f"🎁 আপনার referral করা বন্ধু subscribe করেছেন — আপনি {REFERRAL_BONUS_DAYS} দিনের Pro বোনাস পেলেন!")
     except Exception: log.warning("Could not notify referrer %s", ref)
@@ -6135,6 +6244,7 @@ async def start_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await BOT.ensure_user(update)
     until = await BOT.db.fetchval("""UPDATE users SET plan='pro',plan_until=NOW()+$2*INTERVAL '1 day',trial_used=TRUE WHERE telegram_id=$1 AND NOT trial_used AND NOT blocked
         AND (plan<>'pro' OR plan_until IS NULL OR plan_until<NOW()) RETURNING plan_until""", update.effective_user.id, TRIAL_DAYS)
+    BOT.forget_user(update.effective_user.id)
     if until is None:
         await q.message.reply_text("Free trial আগেই ব্যবহার করা হয়েছে (প্রতি account-এ একবার) বা আপনার access আগে থেকেই সক্রিয়। /subscribe দেখুন।"); return
     await set_user_menu(context.bot, update.effective_user.id, "pro")
@@ -6178,6 +6288,14 @@ async def post_init(application: Application) -> None:
         jq.run_repeating(guarded_job(report_job), interval=300, first=90, name="auto-report")
         jq.run_repeating(guarded_job(portfolio_refresh_job), interval=PF_REFRESH_SECONDS, first=PF_REFRESH_SECONDS, name="portfolio-refresh")
         jq.run_repeating(guarded_job(retention_job), interval=21600, first=300, name="analyses-retention")
+        jq.run_repeating(guarded_job(db_keepalive_job), interval=45, first=10, name="db-keepalive")
+        application.bot_data["lag_probe"] = asyncio.create_task(loop_lag_probe(STATS))
+
+async def db_keepalive_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Touch both warm pool connections so the first user message never pays a reconnect."""
+    del context
+    if BOT and BOT.db:
+        await asyncio.gather(BOT.db.fetchval("SELECT 1"), BOT.db.fetchval("SELECT 1"), return_exceptions=True)
 
 async def post_shutdown(application: Application) -> None:
     del application
@@ -6194,7 +6312,9 @@ def protected(handler: Any) -> Any:
         name=getattr(handler,"__name__",""); action="voice" if "voice" in name else "scanner" if "scanner" in name else "analysis" if name in {"text_handler","run_request"} else "general"
         allowed,retry=await BOT.allow_request(uid,action)
         if not allowed: await update.effective_message.reply_text(f"Rate limit হয়েছে। {retry} সেকেন্ড পরে আবার চেষ্টা করুন।"); return
-        await handler(update,context)
+        started=time.perf_counter()
+        try: await handler(update,context)
+        finally: STATS.record(f"handler:{name or 'anon'}",time.perf_counter()-started)
     return wrapper
 
 
@@ -6264,7 +6384,7 @@ def main() -> None:
     app.add_handler(CommandHandler("portfolio_remove", protected(portfolio_remove_command)))
     app.add_handler(CommandHandler("scorecard", protected(scorecard_command)))
     app.add_handler(CommandHandler("market", protected(market_summary_command)))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(CallbackQueryHandler(STATS.timed("handler:button",callback_handler)))
     app.add_handler(MessageHandler(filters.VOICE, protected(voice_handler)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, protected(text_handler)))
     app.add_error_handler(error_handler)
