@@ -97,3 +97,33 @@ def test_zone_rectangles_hidden_by_default(monkeypatch):
 
 def test_zone_rectangles_return_with_the_switch(monkeypatch):
     assert len(_wide_rectangles(True, monkeypatch, False)) >= 1
+
+
+# ---------------------------------------------------------------- every line is named; S1/R1 are the nearest levels
+def _chart_texts(monkeypatch, supports, resistances, last_close=100.0):
+    import matplotlib.axes
+    texts, orig = [], matplotlib.axes.Axes.text
+
+    def spy(self, x, y, s, *a, **k):
+        texts.append(s)
+        return orig(self, x, y, s, *a, **k)
+    monkeypatch.setattr(matplotlib.axes.Axes, "text", spy)
+    frame = make_frame()
+    res = make_result(frame)
+    res["supports"], res["resistances"] = supports, resistances
+    res["quant"] = {**res["quant"], "breakout": {}}
+    bot.tv_chart(frame, bot.Request("BTC/USDT", "4h", view_candles=150), res, False)
+    return texts
+
+
+def test_levels_are_numbered_nearest_first_and_named_on_the_chart(monkeypatch):
+    frame = make_frame(); last = float(frame.Close.iloc[-1])
+    # deliberately given strongest-first, i.e. NOT nearest-first (the old bug: S3 above S2)
+    supports = [last - 8, last - 3, last - 5]
+    texts = _chart_texts(monkeypatch, supports, [last + 6, last + 2])
+    tags = [t for t in texts if t.startswith(("S", "R")) and "  " in t]
+    by = {t.split("  ")[0]: float(t.split("  ")[1].replace(",", "")) for t in tags}
+    assert by["S1"] > by["S2"] > by["S3"]            # nearest below price first
+    assert by["R1"] < by["R2"]
+    for name in ("Support 1", "Support 2", "Support 3", "Resistance 1", "Resistance 2"):
+        assert name in texts

@@ -1913,13 +1913,14 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
 
     supports = [float(v) for v in result.get("supports", [])]; resistances = [float(v) for v in result.get("resistances", [])]
     bo = ((result.get("quant") or {}).get("breakout")) or {}
-    items: list[dict[str, Any]] = []
-    for i, v in enumerate(supports, 1): items.append({"text": f"S{i}  {money(v)}", "y": v, "color": TV_SUPPORT})
-    for i, v in enumerate(resistances, 1): items.append({"text": f"R{i}  {money(v)}", "y": v, "color": TV_RESIST})
-    for key, name, color in (("bullish_trigger", "▲", TV_TRIG_UP), ("bearish_trigger", "▼", TV_TRIG_DOWN)):
-        if bo.get(key): items.append({"text": f"{name}  {money(float(bo[key]))}", "y": float(bo[key]), "color": color})
-    items = [it for it in items if lo - .35 * span <= it["y"] <= hi + .35 * span]       # far-away levels stay in the written report, not the picture
     last = float(c[-1]); last_color = TV_UP if up[-1] else TV_DOWN
+    items: list[dict[str, Any]] = []
+    # S1/R1 are always the levels nearest to the current price (the list order from the analysis is by strength, which made S3 sit above S2)
+    for i, v in enumerate(sorted(supports, key=lambda v: abs(v - last)), 1): items.append({"text": f"S{i}  {money(v)}", "label": f"Support {i}", "y": v, "color": TV_SUPPORT, "rank": i})
+    for i, v in enumerate(sorted(resistances, key=lambda v: abs(v - last)), 1): items.append({"text": f"R{i}  {money(v)}", "label": f"Resistance {i}", "y": v, "color": TV_RESIST, "rank": i})
+    for key, name, label, color in (("bullish_trigger", "▲", "Bull trigger", TV_TRIG_UP), ("bearish_trigger", "▼", "Bear trigger", TV_TRIG_DOWN)):
+        if bo.get(key): items.append({"text": f"{name}  {money(float(bo[key]))}", "label": label, "y": float(bo[key]), "color": color, "rank": 1, "trigger": True})
+    items = [it for it in items if lo - .35 * span <= it["y"] <= hi + .35 * span]       # far-away levels stay in the written report, not the picture
     plot_h = TV_H - TV_TIME_H
     ys = [lo, hi] + [it["y"] for it in items]
     data_lo = min(ys); data_hi = max(ys) + span * .03
@@ -1938,7 +1939,9 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
     tag_w = math.ceil(widest) + 2 * TV_TAG_PAD
     axis_w = tag_w + TV_AXIS_MARGIN                                            # the price column, like TradingView's
     plot_w = TV_W - axis_w
-    right_pad = max(6, round(n * .08))
+    label_font = tv_font("semibold", 8.4)
+    label_w = (max((text_w(it["label"], label_font) for it in items), default=0) + 16) if items else 0     # on-chart names sit in the empty band right of the last candle
+    right_pad = max(6, round(n * .08), math.ceil(label_w * (n + .5) / max(plot_w - label_w, 1)) if items else 0)
     xlim = (-1.5, n - 1 + right_pad)
 
     fig = plt.figure(figsize=(TV_W / 100, TV_H / 100), dpi=100, facecolor=TV_BG)
@@ -1970,10 +1973,14 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
     for key, color in (("support_zones", TV_SUPPORT), ("resistance_zones", TV_RESIST)):
         for zone in result.get(key, []) or []:
             if zone["high"] >= ymin and zone["low"] <= ymax:
-                if CHART_ZONE_BOXES:       # the filled band is kept in the code but hidden by default: only its two edge lines are drawn
+                if CHART_ZONE_BOXES:       # the filled band and its edge lines are kept in the code but hidden by default
                     ax.add_patch(Rect((-1.5, zone["low"]), n + right_pad + 1, zone["high"] - zone["low"], facecolor=color, alpha=_T["zone_alpha"], linewidth=0, zorder=1))
-                for edge in (zone["low"], zone["high"]): ax.axhline(edge, color=color, linewidth=.6, alpha=.3, zorder=1)
-    for it in items: ax.axhline(it["y"], color=it["color"], linewidth=.9, alpha=_T["level_alpha"], zorder=2)
+                    for edge in (zone["low"], zone["high"]): ax.axhline(edge, color=color, linewidth=.6, alpha=.3, zorder=1)
+    # one line per level - the same ones that carry a tag and a name, so every line on the picture can be identified.
+    # Nearest level = thickest; triggers are dashed so they cannot be mistaken for support/resistance.
+    for it in items:
+        width = 1.6 if it["rank"] == 1 else (1.2 if it["rank"] == 2 else .9)
+        ax.axhline(it["y"], color=it["color"], linewidth=width, alpha=max(_T["level_alpha"], .8), linestyle=(0, (6, 3)) if it.get("trigger") else "-", zorder=2)
     ax.axhline(last, color=last_color, linewidth=.9, linestyle=(0, (1.2, 2.4)), zorder=2)
 
     ax.vlines(x, l, h, colors=colors, linewidth=1.0 if n <= 220 else .7, zorder=4).set_clip_path(keep)
@@ -1987,6 +1994,16 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
         if x0 < 0: y0, x0 = y0 + (y1 - y0) * (0 - x0) / (x1 - x0), 0
         ax.plot([x0, x1], [y0, y1], color=_T["trend"], linewidth=1.5, linestyle=(0, (5, 3)), zorder=6)[0].set_clip_path(keep)
     drawn = draw_overlays(ax, view, (result.get("quant") or {}).get("professional"), offset, tv=True, theme=_T) if overlays else {}
+    if items:                                                          # name each line right on the picture (stays readable even when the image is cropped on a phone)
+        name_gap = 15 * px_y
+        name_y = spread_tags([it["y"] for it in items], name_gap, ymin + name_gap / 2, ymax - name_gap / 2)
+        for it, y in zip(items, name_y):
+            ax.text(xlim[1] - .3, y, it["label"], ha="right", va="center", color=it["color"], fontproperties=label_font, zorder=12, clip_on=False,
+                    bbox={"boxstyle": "round,pad=0.22,rounding_size=0.3", "facecolor": TV_BG, "edgecolor": it["color"], "linewidth": .7, "alpha": .96})
+    for line in (result.get("trendlines") or [])[:2]:
+        x1, y1 = line["end_idx"] - offset, line["end_val"]
+        if 0 <= x1 <= n + right_pad and ymin < y1 < ymax:
+            ax.text(x1, y1 + 9 * px_y, "Trendline", ha="right", va="bottom", color=_T["trend"], fontproperties=tv_font("semibold", 8.0), zorder=12, clip_on=True)
 
     # price scale: numbers at the right, tags drawn flush against the plot; a tick that a tag would cover is left out
     ax.set_yticks([]); ax.set_xticks([])
