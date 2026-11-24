@@ -1978,9 +1978,12 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
                     for edge in (zone["low"], zone["high"]): ax.axhline(edge, color=color, linewidth=.6, alpha=.3, zorder=1)
     # one line per level - the same ones that carry a tag and a name, so every line on the picture can be identified.
     # Nearest level = thickest; triggers are dashed so they cannot be mistaken for support/resistance.
+    # Across the candles the line is only a quiet guide (thin, translucent), so the candles stay the clearest thing on the picture;
+    # in the empty band right of the last candle - where its name and price tag are - it turns bold so it is easy to follow.
     for it in items:
-        width = 1.6 if it["rank"] == 1 else (1.2 if it["rank"] == 2 else .9)
-        ax.axhline(it["y"], color=it["color"], linewidth=width, alpha=max(_T["level_alpha"], .8), linestyle=(0, (6, 3)) if it.get("trigger") else "-", zorder=2)
+        style = (0, (5, 3)) if it.get("trigger") else "-"
+        ax.axhline(it["y"], color=it["color"], linewidth=.8, alpha=.4, linestyle=style, zorder=2)
+        ax.plot([n - .4, xlim[1]], [it["y"]] * 2, color=it["color"], linewidth=1.7 if it["rank"] == 1 else 1.3, alpha=.95, linestyle=style, solid_capstyle="butt", zorder=3)
     ax.axhline(last, color=last_color, linewidth=.9, linestyle=(0, (1.2, 2.4)), zorder=2)
 
     ax.vlines(x, l, h, colors=colors, linewidth=1.0 if n <= 220 else .7, zorder=4).set_clip_path(keep)
@@ -1999,11 +2002,7 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
         name_y = spread_tags([it["y"] for it in items], name_gap, ymin + name_gap / 2, ymax - name_gap / 2)
         for it, y in zip(items, name_y):
             ax.text(xlim[1] - .3, y, it["label"], ha="right", va="center", color=it["color"], fontproperties=label_font, zorder=12, clip_on=False,
-                    bbox={"boxstyle": "round,pad=0.22,rounding_size=0.3", "facecolor": TV_BG, "edgecolor": it["color"], "linewidth": .7, "alpha": .96})
-    for line in (result.get("trendlines") or [])[:2]:
-        x1, y1 = line["end_idx"] - offset, line["end_val"]
-        if 0 <= x1 <= n + right_pad and ymin < y1 < ymax:
-            ax.text(x1, y1 + 9 * px_y, "Trendline", ha="right", va="bottom", color=_T["trend"], fontproperties=tv_font("semibold", 8.0), zorder=12, clip_on=True)
+                    bbox={"boxstyle": "round,pad=0.2,rounding_size=0.3", "facecolor": TV_BG, "edgecolor": "none", "alpha": .92})
 
     # price scale: numbers at the right, tags drawn flush against the plot; a tick that a tag would cover is left out
     ax.set_yticks([]); ax.set_xticks([])
