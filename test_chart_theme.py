@@ -70,3 +70,30 @@ def test_async_render_takes_theme():
 def test_settings_keyboard_offers_both_themes():
     data = {b.callback_data for row in bot.settings_keyboard().inline_keyboard for b in row}
     assert {"set|chart_theme|dark", "set|chart_theme|paper"} <= data
+
+
+# ---------------------------------------------------------------- zone rectangles are hidden by default, kept in code
+def _wide_rectangles(boxes, monkeypatch, overlays):
+    import matplotlib.axes
+    monkeypatch.setattr(bot, "CHART_ZONE_BOXES", boxes)
+    seen, orig = [], matplotlib.axes.Axes.add_patch
+
+    def spy(self, patch):
+        if patch.__class__.__name__ == "Rectangle" and patch.get_width() > 5 and patch.get_height() > 0: seen.append(patch)
+        return orig(self, patch)
+    monkeypatch.setattr(matplotlib.axes.Axes, "add_patch", spy)
+    frame = make_frame()
+    res = make_result(frame)
+    q = res["quant"]
+    res["support_zones"], res["resistance_zones"] = q["supports"], q["resistances"]
+    bot.tv_chart(frame, bot.Request("BTC/USDT", "4h", view_candles=150), res, overlays)
+    return seen
+
+
+def test_zone_rectangles_hidden_by_default(monkeypatch):
+    assert not bot.CHART_ZONE_BOXES
+    assert _wide_rectangles(False, monkeypatch, True) == []
+
+
+def test_zone_rectangles_return_with_the_switch(monkeypatch):
+    assert len(_wide_rectangles(True, monkeypatch, False)) >= 1

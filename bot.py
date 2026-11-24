@@ -1650,6 +1650,11 @@ def _in_range(price: float, lo: float, hi: float) -> bool:
     return lo - pad <= price <= hi + pad
 
 
+# Zone rectangles (support/resistance bands, FVG, order blocks) clutter the picture, so by default charts show
+# lines only. The rectangle code stays: set CHART_ZONE_BOXES=1 to bring the boxes back.
+CHART_ZONE_BOXES = os.getenv("CHART_ZONE_BOXES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def draw_overlays(ax: Any, view: pd.DataFrame, professional: dict[str, Any] | None, offset: int = 0, *,
                   max_fvg: int = 4, max_ob: int = 3, max_sweeps: int = 4, show_vwap: bool = True, show_profile: bool = True, tv: bool = False, theme: dict[str, Any] | None = None) -> dict[str, int]:
     """Draw overlays on ``ax`` and return how many items of each kind were drawn. ``tv`` = the quieter TradingView-style look."""
@@ -1669,7 +1674,10 @@ def draw_overlays(ax: Any, view: pd.DataFrame, professional: dict[str, Any] | No
     for g in fvgs[-max_fvg:]:
         color = GREEN if g["type"].startswith("BULL") else RED
         x0 = g["idx"] - offset - 2
-        ax.add_patch(Rectangle((x0, g["low"]), right - x0, g["high"] - g["low"], facecolor=color, alpha=.13, edgecolor=color, linewidth=.6, linestyle=":", zorder=1))
+        if CHART_ZONE_BOXES:
+            ax.add_patch(Rectangle((x0, g["low"]), right - x0, g["high"] - g["low"], facecolor=color, alpha=.13, edgecolor=color, linewidth=.6, linestyle=":", zorder=1))
+        else:
+            for edge in (g["low"], g["high"]): ax.plot([x0, right], [edge, edge], color=color, linewidth=.8, linestyle=":", alpha=.85, zorder=1)
         if tv: ax.text(x0 + .6, g["high"], "FVG", color=color, ha="left", va="top", alpha=.9, clip_on=True, **note)
         else: ax.text(right - .5, (g["low"] + g["high"]) / 2, "FVG", color=color, fontsize=6.5, ha="right", va="center", alpha=.9, clip_on=True)
         drawn["fvg"] += 1
@@ -1678,7 +1686,10 @@ def draw_overlays(ax: Any, view: pd.DataFrame, professional: dict[str, Any] | No
     for o in obs[-max_ob:]:
         color = GREEN if o["type"].startswith("BULL") else RED
         x0 = o["idx"] - offset - .5
-        ax.add_patch(Rectangle((x0, o["low"]), right - x0, o["high"] - o["low"], facecolor="none", edgecolor=color, linewidth=1.0, linestyle="--", alpha=.85, zorder=2))
+        if CHART_ZONE_BOXES:
+            ax.add_patch(Rectangle((x0, o["low"]), right - x0, o["high"] - o["low"], facecolor="none", edgecolor=color, linewidth=1.0, linestyle="--", alpha=.85, zorder=2))
+        else:
+            for edge in (o["low"], o["high"]): ax.plot([x0, right], [edge, edge], color=color, linewidth=1.0, linestyle="--", alpha=.85, zorder=2)
         ax.text(x0 + .5, o["high"], "OB", color=color, ha="left", va="bottom", clip_on=True, **note)
         drawn["order_blocks"] += 1
 
@@ -1959,7 +1970,8 @@ def tv_chart(frame: pd.DataFrame, request: Request, result: dict[str, Any], over
     for key, color in (("support_zones", TV_SUPPORT), ("resistance_zones", TV_RESIST)):
         for zone in result.get(key, []) or []:
             if zone["high"] >= ymin and zone["low"] <= ymax:
-                ax.add_patch(Rect((-1.5, zone["low"]), n + right_pad + 1, zone["high"] - zone["low"], facecolor=color, alpha=_T["zone_alpha"], linewidth=0, zorder=1))
+                if CHART_ZONE_BOXES:       # the filled band is kept in the code but hidden by default: only its two edge lines are drawn
+                    ax.add_patch(Rect((-1.5, zone["low"]), n + right_pad + 1, zone["high"] - zone["low"], facecolor=color, alpha=_T["zone_alpha"], linewidth=0, zorder=1))
                 for edge in (zone["low"], zone["high"]): ax.axhline(edge, color=color, linewidth=.6, alpha=.3, zorder=1)
     for it in items: ax.axhline(it["y"], color=it["color"], linewidth=.9, alpha=_T["level_alpha"], zorder=2)
     ax.axhline(last, color=last_color, linewidth=.9, linestyle=(0, (1.2, 2.4)), zorder=2)
